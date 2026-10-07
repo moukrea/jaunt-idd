@@ -11,6 +11,9 @@
 # changed), 4 not an administrator, 5 not for this computer.
 # SPDX-License-Identifier: MIT
 param([string]$AllowedUser = "", [switch]$Yes, [switch]$TestSigning, [string]$Result = "")
+# This PowerShell's own modules first: started from PowerShell 7, Windows PowerShell inherits its
+# PSModulePath and finds none of its script-defined commands (Get-FileHash, Expand-Archive).
+$env:PSModulePath = "$PSHOME\Modules;$env:PSModulePath"
 $ErrorActionPreference = "Stop"
 $report = [ordered]@{ action = "install"; installed = $false; version = $null; signer = $null; allowedUser = $null; devices = @(); rebootRequired = $false; pipe = $false; error = $null }
 
