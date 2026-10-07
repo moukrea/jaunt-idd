@@ -1,0 +1,52 @@
+# Build jaunt's indirect display driver for x64 and ARM64 on every push and pull request, test its
+# control protocol, check the install scripts (tests/scripts_test.ps1), and make the catalog again
+# as a release does after signing (catalog.ps1). GitHub's runners cannot load the driver: it is
+# unsigned here, and test-signing mode needs a restart.
+# SPDX-License-Identifier: MIT
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [x64, ARM64]
+    env:
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Build, and test the control protocol
+        shell: pwsh
+        run: |
+          $r = ./build.ps1 -Platform $env:PLATFORM -Version 0.0.1 -Out out | Select-Object -Last 1
+          $r
+          $j = $r | ConvertFrom-Json
+          if ($j.protocolTests -ne "passed" -or -not ($j.driver -like "built*")) { exit 1 }
+          if ($j.versionInfo.productName -ne "jaunt indirect display driver" -or $j.versionInfo.productVersion -ne "0.0.1") {
+            "::error::The DLL's version information: $($j.versionInfo | ConvertTo-Json -Compress)"
+            exit 1
+          }
+      - name: The install scripts
+        if: matrix.platform == 'x64'
+        shell: pwsh
+        run: powershell.exe -NoProfile -NonInteractive -InputFormat None -ExecutionPolicy Bypass -File tests/scripts_test.ps1 -Package out/x64/package
+      - name: The catalog, made again as a release does after signing
+        shell: pwsh
+        run: |
+          Copy-Item -Recurse "out/$env:PLATFORM/package/driver" catalog-check
+          ./catalog.ps1 -Driver catalog-check -Platform $env:PLATFORM
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: package-${{ matrix.platform }}-unsigned
+          path: |
+            out/${{ matrix.platform }}/package
+            out/*.log

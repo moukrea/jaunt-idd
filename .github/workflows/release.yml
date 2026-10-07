@@ -1,0 +1,170 @@
+# Release jaunt's indirect display driver from a tag vMAJOR.MINOR.PATCH, built on GitHub's runners
+# for x64 and ARM64.
+# - Signed through SignPath Foundation once this repository's signing is set up (the secret
+#   SIGNPATH_API_TOKEN and the variable SIGNPATH_ORGANIZATION_ID; README.md, "Code signing
+#   policy"): the DLL first, then the catalog Inf2Cat makes over the signed DLL. A maintainer
+#   approves each signing request in SignPath.
+# - Until then, released unsigned as a pre-release titled "unsigned, test-signing only": Windows
+#   loads it only once signed with a test certificate, in test-signing mode; install.ps1 refuses it
+#   as published.
+# The release holds jaunt-idd-x64.zip, jaunt-idd-ARM64.zip and their SHA256SUMS.
+# SPDX-License-Identifier: MIT
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      signed: ${{ steps.plan.outputs.signed }}
+    steps:
+      - id: plan
+        env:
+          TAG: ${{ github.ref_name }}
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}$ ]] || [ "$TAG" = v0.0.0 ]; then
+            echo "::error::A release tag is vMAJOR.MINOR.PATCH other than v0.0.0, not $TAG"
+            exit 1
+          fi
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          if [ -n "$SIGNPATH_API_TOKEN" ] && [ -n "$SIGNPATH_ORGANIZATION_ID" ]; then
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          fi
+  build:
+    needs: plan
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        platform: [x64, ARM64]
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      SIGNED: ${{ needs.plan.outputs.signed }}
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Build, and test the control protocol
+        shell: pwsh
+        run: |
+          $r = ./build.ps1 -Platform $env:PLATFORM -Version $env:VERSION -Out out | Select-Object -Last 1
+          $r
+          $j = $r | ConvertFrom-Json
+          if ($j.protocolTests -ne "passed" -or -not ($j.driver -like "built*")) { exit 1 }
+          if ($j.versionInfo.productName -ne "jaunt indirect display driver" -or $j.versionInfo.productVersion -ne $env:VERSION) {
+            "::error::The DLL's version information is not this release's: $($j.versionInfo | ConvertTo-Json -Compress)"
+            exit 1
+          }
+      - name: The install scripts
+        if: matrix.platform == 'x64'
+        shell: pwsh
+        run: powershell.exe -NoProfile -NonInteractive -InputFormat None -ExecutionPolicy Bypass -File tests/scripts_test.ps1 -Package out/x64/package
+      - name: The DLL to sign
+        if: env.SIGNED == 'true'
+        id: dll
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unsigned-dll-${{ matrix.platform }}
+          path: out/${{ matrix.platform }}/package/driver/JauntIdd.dll
+      - name: Sign the DLL (SignPath)
+        if: env.SIGNED == 'true'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: jaunt-idd
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: driver-dll
+          github-artifact-id: ${{ steps.dll.outputs.artifact-id }}
+          parameters: |
+            version: "${{ needs.plan.outputs.version }}"
+          wait-for-completion: true
+          output-artifact-directory: signed-dll
+      - name: The catalog over the signed DLL
+        if: env.SIGNED == 'true'
+        shell: pwsh
+        run: |
+          Copy-Item signed-dll/JauntIdd.dll "out/$env:PLATFORM/package/driver/" -Force
+          ./catalog.ps1 -Driver "out/$env:PLATFORM/package/driver" -Platform $env:PLATFORM
+      - name: The catalog to sign
+        if: env.SIGNED == 'true'
+        id: cat
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unsigned-cat-${{ matrix.platform }}
+          path: out/${{ matrix.platform }}/package/driver/jaunt-idd.cat
+      - name: Sign the catalog (SignPath)
+        if: env.SIGNED == 'true'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: jaunt-idd
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: driver-catalog
+          github-artifact-id: ${{ steps.cat.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed-cat
+      - name: The package
+        shell: pwsh
+        run: |
+          $driver = "out/$env:PLATFORM/package/driver"
+          if ($env:SIGNED -eq "true") {
+            Copy-Item signed-cat/jaunt-idd.cat "$driver/" -Force
+            foreach ($f in "jaunt-idd.cat", "JauntIdd.dll") {
+              $s = Get-AuthenticodeSignature "$driver/$f"
+              if ($s.Status -ne "Valid") { "::error::$f is $($s.Status) after signing"; exit 1 }
+              "$f signed by $($s.SignerCertificate.Subject)"
+            }
+          }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [IO.Compression.ZipFile]::CreateFromDirectory((Resolve-Path "out/$env:PLATFORM/package").Path, "$PWD/jaunt-idd-$env:PLATFORM.zip")
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: jaunt-idd-${{ matrix.platform }}
+          path: jaunt-idd-${{ matrix.platform }}.zip
+  release:
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      SIGNED: ${{ needs.plan.outputs.signed }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: jaunt-idd-*
+          merge-multiple: true
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          sha256sum jaunt-idd-x64.zip jaunt-idd-ARM64.zip > SHA256SUMS
+          cat SHA256SUMS
+          if [ "$SIGNED" = true ]; then
+            title="jaunt-idd $VERSION"
+            signing="Signed through SignPath Foundation: free code signing provided by SignPath.io, certificate by SignPath Foundation. When installing it, Windows asks whether to install device software from \"SignPath Foundation\"."
+            flags=""
+          else
+            title="jaunt-idd $VERSION (unsigned, test-signing only)"
+            signing="**Unsigned, for test-signing only.** install.ps1 refuses this build as published: to try it, sign it with a test certificate on a computer in test-signing mode. Signed releases come through SignPath Foundation, under the code signing policy below."
+            flags="--prerelease"
+          fi
+          VERSION="$VERSION" SIGNING="$signing" python3 -c 'import os, sys; t = open(".github/release-notes.md").read(); sys.stdout.write(t.replace("{version}", os.environ["VERSION"]).replace("{signing}", os.environ["SIGNING"]))' > notes.md
+          gh release create "$TAG" jaunt-idd-x64.zip jaunt-idd-ARM64.zip SHA256SUMS --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "$title" --notes-file notes.md $flags

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SignPath artifact configuration "driver-dll" of the project jaunt-idd (a copy of what is set up
+     in SignPath). The input is the GitHub artifact release.yml uploads: a zip holding JauntIdd.dll.
+     It is signed only when its version information names this product and the release's version
+     (src/jaunt-idd.rc; release.yml passes the version from the tag).
+     SPDX-License-Identifier: MIT -->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <parameters>
+    <parameter name="version" required="true" />
+  </parameters>
+  <zip-file>
+    <pe-file path="JauntIdd.dll" product-name="jaunt indirect display driver" product-version="${version}"
+             company-name="jaunt" original-filename="JauntIdd.dll">
+      <authenticode-sign />
+    </pe-file>
+  </zip-file>
+</artifact-configuration>

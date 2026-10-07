@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SignPath artifact configuration "driver-catalog" of the project jaunt-idd (a copy of what is set
+     up in SignPath). The input is the GitHub artifact release.yml uploads after the DLL is signed: a
+     zip holding jaunt-idd.cat, made by Inf2Cat (catalog.ps1) over the signed DLL and the INF. SignPath
+     has no metadata restrictions for catalogs: the DLL whose hash it holds was checked when signed.
+     SPDX-License-Identifier: MIT -->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <zip-file>
+    <catalog-file path="jaunt-idd.cat">
+      <authenticode-sign />
+    </catalog-file>
+  </zip-file>
+</artifact-configuration>

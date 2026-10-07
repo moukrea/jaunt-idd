@@ -1,0 +1,165 @@
+# Install jaunt's indirect display driver on this computer (Windows 10 1903 or later), as an
+# administrator, from a release's package folder (this script, setup\, and driver\ with
+# JauntIdd.dll, jaunt-idd.inf and jaunt-idd.cat):
+#   powershell -ExecutionPolicy Bypass -File install.ps1 [-AllowedUser <SID>] [-Yes] [-TestSigning] [-Result <file>]
+# It says what it will change and asks first; -Yes is for a program that has already shown that
+# and asked. It installs only a package whose signature Windows accepts, never an unsigned one.
+# -TestSigning also accepts a package signed with a test certificate, on a computer already in
+# test-signing mode: this script never turns that mode on. -AllowedUser: the account that may ask the driver for monitors besides SYSTEM (default:
+# the account running this). uninstall.ps1 removes everything this adds. -Result: a JSON report.
+# Exit codes: 0 installed, 1 failed (nothing left half done), 2 declined, 3 not signed (nothing
+# changed), 4 not an administrator, 5 not for this computer.
+# SPDX-License-Identifier: MIT
+param([string]$AllowedUser = "", [switch]$Yes, [switch]$TestSigning, [string]$Result = "")
+$ErrorActionPreference = "Stop"
+$report = [ordered]@{ action = "install"; installed = $false; version = $null; signer = $null; allowedUser = $null; devices = @(); rebootRequired = $false; pipe = $false; error = $null }
+
+function Finish([int]$code, [string]$message) {
+    if ($message) { $report.error = $message; Write-Host $message }
+    if ($Result) { $report | ConvertTo-Json -Compress | Set-Content -Encoding UTF8 -Path $Result }
+    exit $code
+}
+
+$here = $PSScriptRoot
+$target = Join-Path $env:ProgramFiles "jaunt-idd"
+$appsKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\jaunt-idd"
+$files = @("install.ps1", "uninstall.ps1", "setup\JauntIddSetup.cs", "driver\JauntIdd.dll", "driver\jaunt-idd.inf", "driver\jaunt-idd.cat")
+
+# ---- what is checked before anything changes ---------------------------------------------------
+$build = [Environment]::OSVersion.Version.Build
+if ($build -lt 18362) { Finish 5 "Windows 10 version 1903 (build 18362) or later is needed; this is build $build." }
+$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { Finish 4 "Run this as an administrator." }
+foreach ($f in $files) { if (-not (Test-Path (Join-Path $here $f))) { Finish 1 "$f is missing from $here." } }
+
+# The package's architecture (its DLL's) is this computer's.
+$os = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment").PROCESSOR_ARCHITECTURE
+$bytes = [IO.File]::ReadAllBytes((Join-Path $here "driver\JauntIdd.dll"))
+$machine = [BitConverter]::ToUInt16($bytes, [BitConverter]::ToInt32($bytes, 0x3c) + 4)
+$packageArch = switch ($machine) { 0x8664 { "AMD64" } 0xAA64 { "ARM64" } default { "unknown" } }
+if ($packageArch -ne $os) { Finish 5 "This package is for $packageArch and this computer is ${os}; take the release's other package." }
+
+# Signed: Windows accepts the catalog's and the DLL's signatures.
+function Signatures([string]$folder) {
+    @("driver\jaunt-idd.cat", "driver\JauntIdd.dll") | ForEach-Object { Get-AuthenticodeSignature (Join-Path $folder $_) }
+}
+$testMode = [string](Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control").SystemStartOptions -match "TESTSIGNING"
+function Refused($signatures) {
+    $bad = @($signatures | Where-Object { $_.Status -ne "Valid" })
+    if (-not $bad.Count) { return $null }
+    # Unsigned: never. Signed with a test certificate: only with -TestSigning, in test-signing mode.
+    $unsigned = @($bad | Where-Object { $_.Status -eq "NotSigned" })
+    if ($TestSigning -and $testMode -and -not $unsigned.Count) { return $null }
+    $what = ($bad | ForEach-Object { "$(Split-Path -Leaf $_.Path): $($_.Status)" }) -join ", "
+    $why = ""
+    if ($TestSigning -and $unsigned.Count) { $why = " -TestSigning accepts a package signed with a test certificate, not an unsigned one." }
+    elseif ($TestSigning) { $why = " This computer is not in test-signing mode, and this script does not turn it on." }
+    return "Not installed: this package's signature is not one Windows accepts ($what).$why Signed releases: https://github.com/moukrea/jaunt-idd/releases"
+}
+$signatures = Signatures $here
+$refusal = Refused $signatures
+if ($refusal) { Finish 3 $refusal }
+$signer = $signatures[0].SignerCertificate
+$report.signer = if ($signer) { $signer.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) } else { $null }
+
+$driverVer = (Select-String -Path (Join-Path $here "driver\jaunt-idd.inf") -Pattern '^\s*DriverVer\s*=\s*(.+)$' | Select-Object -First 1).Matches[0].Groups[1].Value.Trim()
+$report.version = ($driverVer -split ",")[-1].Trim()
+
+if (-not $AllowedUser) { $AllowedUser = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value }
+if ($AllowedUser -notmatch '^S-1-[0-9]+(-[0-9]+)+$') { Finish 1 "-AllowedUser is a SID (S-1-5-21-...), not '$AllowedUser'." }
+$report.allowedUser = $AllowedUser
+$account = $AllowedUser
+try { $account = (New-Object Security.Principal.SecurityIdentifier($AllowedUser)).Translate([Security.Principal.NTAccount]).Value + " ($AllowedUser)" } catch { }
+
+# ---- what changes, said before it does ----------------------------------------------------------
+$publisher = if ($report.signer) { $report.signer } else { "its publisher" }
+Write-Host @"
+jaunt's indirect display driver $($report.version) is about to be installed on this computer. This changes the system:
+  - its driver package goes into Windows' driver store, and a device "jaunt virtual display" is
+    added under Display adapters;
+  - only SYSTEM and $account may ask it for virtual monitors;
+  - its files are kept in $target, with an entry in Settings > Apps to remove it.
+It shows no monitor until that account's program asks for one, and sends nothing over the network.
+Windows may ask whether to install device software from "$publisher": that is this driver.
+uninstall.ps1 (or Settings > Apps) removes all of it.
+"@
+if (-not $Yes) {
+    $answer = Read-Host "Install it? [y/N]"
+    if ($answer -notmatch '^\s*(y|yes)\s*$') { Finish 2 "Nothing was installed." }
+}
+
+# ---- the changes ---------------------------------------------------------------------------------
+$created = @()
+$stage = "$target.new"
+try {
+    # A copy only administrators can change (in Program Files), checked again there, which the
+    # driver is installed from; it replaces the installed copy, uninstall.ps1 with it, only once the
+    # driver is installed.
+    $source = $target
+    if ($here.TrimEnd("\") -ne $target.TrimEnd("\")) {
+        if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+        New-Item -ItemType Directory -Force "$stage\setup", "$stage\driver" | Out-Null
+        foreach ($f in $files + @("README.md", "LICENSE", "NOTICE.md")) {
+            if (Test-Path (Join-Path $here $f)) { Copy-Item (Join-Path $here $f) (Join-Path $stage $f) }
+        }
+        $refusal = Refused (Signatures $stage)
+        if ($refusal) { Remove-Item -Recurse -Force $stage; Finish 3 $refusal }
+        $source = $stage
+    }
+    Add-Type -TypeDefinition (Get-Content -Raw (Join-Path $source "setup\JauntIddSetup.cs"))
+
+    $devices = @([JauntIddSetup]::FindDevices())
+    if (-not $devices.Count) {
+        $devices = @([JauntIddSetup]::CreateDevice())
+        $created = $devices
+    }
+    foreach ($d in $devices) { [JauntIddSetup]::SetAllowedUser($d, $AllowedUser) }
+    $report.rebootRequired = [JauntIddSetup]::InstallDriver((Join-Path $source "driver\jaunt-idd.inf"))
+    $report.devices = $devices
+} catch {
+    $message = $_.Exception.Message
+    foreach ($d in $created) { try { [JauntIddSetup]::Remove($d) } catch { } }
+    if (Test-Path $stage) { Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue }
+    Finish 1 "Not installed: $message. Nothing was left half installed."
+}
+if ($source -eq $stage) {
+    try {
+        if (Test-Path $target) { Remove-Item -Recurse -Force $target }
+        Move-Item $stage $target
+    } catch {
+        Write-Host "The driver is installed, but its files stayed in $stage ($($_.Exception.Message)): remove it with $stage\uninstall.ps1."
+    }
+}
+# A device that was there reads AllowedUser again when it starts. The driver is installed by now:
+# a failure here is said, not undone.
+if (-not $created.Count) {
+    foreach ($d in $devices) {
+        try { [JauntIddSetup]::Restart($d) } catch { $report.rebootRequired = $true; Write-Host "The device did not restart ($($_.Exception.Message)): restart Windows for the account allowed to apply." }
+    }
+}
+
+# Settings > Apps: the way to remove it.
+try {
+    New-Item -Force $appsKey | Out-Null
+    $powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $values = [ordered]@{ DisplayName = "jaunt indirect display driver"; DisplayVersion = $report.version; Publisher = "jaunt"; InstallLocation = $target
+                          URLInfoAbout = "https://github.com/moukrea/jaunt-idd"
+                          UninstallString = "`"$powershell`" -NoProfile -ExecutionPolicy Bypass -File `"$target\uninstall.ps1`"" }
+    foreach ($name in $values.Keys) { New-ItemProperty -Force -Path $appsKey -Name $name -Value $values[$name] -PropertyType String | Out-Null }
+    foreach ($name in "NoModify", "NoRepair") { New-ItemProperty -Force -Path $appsKey -Name $name -Value 1 -PropertyType DWord | Out-Null }
+} catch {
+    Write-Host "The entry in Settings > Apps was not written ($($_.Exception.Message)): remove the driver with $target\uninstall.ps1."
+}
+
+# The driver's pipe, once Windows has started it.
+$deadline = (Get-Date).AddSeconds(20)
+do {
+    try { $report.pipe = [bool](@([IO.Directory]::GetFiles("\\.\pipe\")) -contains "\\.\pipe\jaunt-idd") } catch { }
+    if ($report.pipe -or (Get-Date) -gt $deadline) { break }
+    Start-Sleep -Milliseconds 500
+} while ($true)
+$report.installed = $true
+if ($report.rebootRequired) { Write-Host "Installed. Windows needs a restart before the driver runs." }
+elseif ($report.pipe) { Write-Host "Installed: the driver is running." }
+else { Write-Host "Installed, but the driver has not started yet: see Device Manager > Display adapters > jaunt virtual display." }
+Finish 0 ""

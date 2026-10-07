@@ -1,0 +1,73 @@
+;
+; jaunt-idd.inf: jaunt's indirect display driver (IddCx, UMDF 2): virtual monitors of any mode for
+; the jaunt desktop agent, made through a control pipe open to SYSTEM and one account only.
+; Based on Microsoft's IddSampleDriver.inf (Windows-driver-samples, MIT; see NOTICE.md).
+; SPDX-License-Identifier: MIT
+;
+
+[Version]
+PnpLockdown=1
+Signature="$Windows NT$"
+ClassGUID={4D36E968-E325-11CE-BFC1-08002BE10318}
+Class=Display
+ClassVer=2.0
+Provider=%ManufacturerName%
+CatalogFile=jaunt-idd.cat
+DriverVer=
+
+[Manufacturer]
+%ManufacturerName%=Standard,NT$ARCH$.10.0...18362
+
+[Standard.NT$ARCH$.10.0...18362]
+%DeviceName%=JauntIdd_Install, Root\JauntIdd
+
+[SourceDisksFiles]
+JauntIdd.dll=1
+
+[SourceDisksNames]
+1=%DiskName%
+
+[JauntIdd_Install.NT]
+CopyFiles=UMDriverCopy
+
+[JauntIdd_Install.NT.hw]
+AddReg=JauntIdd_HardwareDeviceSettings
+
+[JauntIdd_HardwareDeviceSettings]
+HKR,,"UpperFilters",%REG_MULTI_SZ%,"IndirectKmd"
+HKR,"WUDF","DeviceGroupId",%REG_SZ%,"JauntIddGroup"
+
+[UMDriverCopy]
+JauntIdd.dll
+
+[DestinationDirs]
+UMDriverCopy=13
+
+[JauntIdd_Install.NT.Services]
+AddService=WUDFRd,0x000001fa,WUDFRD_ServiceInstall
+
+[WUDFRD_ServiceInstall]
+DisplayName=%WudfRdDisplayName%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\WUDFRd.sys
+
+[JauntIdd_Install.NT.Wdf]
+UmdfService=JauntIdd,JauntIdd_Install_UmdfService
+UmdfServiceOrder=JauntIdd
+UmdfKernelModeClientPolicy=AllowKernelModeClients
+UmdfHostProcessSharing=ProcessSharingDisabled
+
+[JauntIdd_Install_UmdfService]
+UmdfLibraryVersion=$UMDFVERSION$
+ServiceBinary=%13%\JauntIdd.dll
+UmdfExtensions=IddCx0102
+
+[Strings]
+ManufacturerName="jaunt"
+DiskName="jaunt indirect display driver"
+DeviceName="jaunt virtual display"
+WudfRdDisplayName="Windows Driver Foundation - User-mode Driver Framework Reflector"
+REG_MULTI_SZ=0x00010000
+REG_SZ=0x00000000

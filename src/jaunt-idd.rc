@@ -1,0 +1,35 @@
+// jaunt-idd.rc: the driver DLL's version information. Windows shows it in the file's properties;
+// SignPath checks its product name and version before signing (.signpath/artifact-configurations).
+// The version comes from jaunt-idd.vcxproj (JauntIddVersion, set by build.ps1 -Version).
+// SPDX-License-Identifier: MIT
+#include <windows.h>
+#include "jaunt-idd-version.h"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION JAUNT_IDD_VERSION_COMMA
+ PRODUCTVERSION JAUNT_IDD_VERSION_COMMA
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+ FILEFLAGS 0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_DLL
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "jaunt"
+            VALUE "FileDescription", "jaunt indirect display driver"
+            VALUE "FileVersion", JAUNT_IDD_VERSION_STRING
+            VALUE "InternalName", "JauntIdd"
+            VALUE "LegalCopyright", "Copyright (c) 2026 jaunt contributors. MIT License."
+            VALUE "OriginalFilename", "JauntIdd.dll"
+            VALUE "ProductName", "jaunt indirect display driver"
+            VALUE "ProductVersion", JAUNT_IDD_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
