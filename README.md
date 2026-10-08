@@ -95,10 +95,12 @@ test certificate on a computer in test-signing mode.
 
 ## Test plan
 
-GitHub's runners cannot load the driver (it is unsigned there, and test-signing mode needs a
-restart), so CI builds it, runs the protocol tests and checks the install scripts. On a test
-computer (a virtual machine with `bcdedit /set testsigning on` set by hand, the build signed with a
-test certificate it trusts):
+CI builds the driver, runs the protocol tests and checks the install scripts. GitHub's Windows
+runner boots in test-signing mode, so CI also signs the build with a throwaway test certificate
+made in the job, installs it, adds and removes a monitor, checks that a silent or closed connection
+loses its monitors, uninstalls it and removes the certificate (`tests/load_test.ps1`, which runs on
+GitHub's hosted runners only; reported for now). On a test computer (a virtual machine with
+`bcdedit /set testsigning on` set by hand, the build signed with a test certificate it trusts):
 
 1. `install.ps1 -TestSigning`; `Get-PnpDevice -FriendlyName "jaunt virtual display"` shows it
    started, and `\\.\pipe\jaunt-idd` exists.

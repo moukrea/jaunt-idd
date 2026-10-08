@@ -1,7 +1,7 @@
 # Build jaunt's indirect display driver for x64 and ARM64 on every push and pull request, test its
-# control protocol, check the install scripts (tests/scripts_test.ps1), and make the catalog again
-# as a release does after signing (catalog.ps1). GitHub's runners cannot load the driver: it is
-# unsigned here, and test-signing mode needs a restart.
+# control protocol, check the install scripts (tests/scripts_test.ps1), make the catalog again as a
+# release does after signing (catalog.ps1), and, on x64, load and use the driver signed with a
+# throwaway test certificate (tests/load_test.ps1; GitHub's runner boots in test-signing mode).
 # SPDX-License-Identifier: MIT
 name: ci
 on:
@@ -43,6 +43,15 @@ jobs:
         run: |
           Copy-Item -Recurse "out/$env:PLATFORM/package/driver" catalog-check
           ./catalog.ps1 -Driver catalog-check -Platform $env:PLATFORM
+      # Reported, not failing the job yet: GitHub's runner boots in test-signing mode, so the package,
+      # signed with a test certificate made in this job and removed after, can be installed, used
+      # (a monitor added and removed, the watchdog) and uninstalled (tests/load_test.ps1).
+      - name: The driver loaded and used, with a throwaway test certificate (reported)
+        if: matrix.platform == 'x64'
+        continue-on-error: true
+        timeout-minutes: 20
+        shell: pwsh
+        run: powershell.exe -NoProfile -NonInteractive -InputFormat None -ExecutionPolicy Bypass -File tests/load_test.ps1 -Package out/x64/package
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
