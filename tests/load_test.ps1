@@ -6,11 +6,13 @@
 # a computer already in test-signing mode (this never turns that mode on), as an administrator,
 # with no jaunt-idd installed. The certificate's private key cannot be exported and never leaves
 # this run; the certificate leaves the machine's stores at the end, whatever happened.
-#   powershell -NoProfile -NonInteractive -InputFormat None -ExecutionPolicy Bypass -File tests\load_test.ps1 -Package out\x64\package
+#   powershell -NoProfile -NonInteractive -InputFormat None -ExecutionPolicy Bypass -File tests\load_test.ps1 -Package out\x64\package [-Then <script.ps1>]
+# -Then: a script run with the driver installed, before it is removed (a program that uses the
+# driver checks itself there); its exit code and output are a step.
 # Writes one JSON line: {ran: false, why} where it does not run, else each step; exits 1 when a step
 # failed (CI reports it).
 # SPDX-License-Identifier: MIT
-param([Parameter(Mandatory = $true)][string]$Package)
+param([Parameter(Mandatory = $true)][string]$Package, [string]$Then = "")
 $env:PSModulePath = "$PSHOME\Modules;$env:PSModulePath"
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
@@ -318,6 +320,21 @@ try {
     $pipeThere = [bool](WaitFor { PipeThere } 30)
     Step "the device started, its pipe there" ($pipeThere -and @($status | Where-Object { $_ -match " OK$" }).Count -eq 1) ([ordered]@{ devices = $status; pipe = $pipeThere; displays = $displaysBefore })
 
+    # ---- what the caller checks with the driver installed, before any monitor of ours -----------
+    if ($Then -and $pipeThere) {
+        $thenOut = Join-Path $work "then.out"
+        $thenIn = Join-Path $work "then.in"
+        New-Item -ItemType File -Force $thenIn | Out-Null
+        $quoted = (@("-NoProfile", "-NonInteractive", "-InputFormat", "None", "-ExecutionPolicy", "Bypass", "-File", $Then) |
+            ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join " "
+        $process = Start-Process -FilePath "powershell.exe" -ArgumentList $quoted -PassThru -NoNewWindow `
+            -RedirectStandardOutput $thenOut -RedirectStandardError "$thenOut.err" -RedirectStandardInput $thenIn
+        $null = $process.Handle
+        $code = if ($process.WaitForExit(600000)) { $process.ExitCode } else { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue; -1 }
+        $tail = { param($path) $text = [string](Get-Content -Raw $path -ErrorAction SilentlyContinue); if ($text.Length -gt 2000) { $text.Substring($text.Length - 2000) } else { $text } }
+        Step "then: $(Split-Path -Leaf $Then)" ($code -eq 0) ([ordered]@{ exitCode = $code; output = (& $tail $thenOut); errors = (& $tail "$thenOut.err") })
+    }
+
     if ($pipeThere) {
         # ---- a monitor added, listed by Windows, removed ----------------------------------------
         $pipe = Connect
@@ -416,6 +433,36 @@ try {
         $pipe = $null
         $gone = [bool](WaitFor { -not (Shown "640x480").Count } 15)
         Step "that connection closed: its eight monitors removed" $gone ([ordered]@{ displays = @([JauntIddDisplays]::Attached()) })
+        # ---- the driver after that: still there and answering, or stopped or restarted ----------
+        $still = [bool](WaitFor { PipeThere } 15)
+        $answer = $null
+        $addAfter = $null
+        $removeAfter = $null
+        if ($still) {
+            try {
+                $pipe = Connect
+                $answer = Ask $pipe "status"
+                # A regression check: a new monitor once that connection is gone.
+                $addAfter = Ask $pipe "add 640 480 60"
+                if ($addAfter -match '^ok (\d+)$') { $removeAfter = Ask $pipe "remove $($Matches[1])" }
+                $pipe.Dispose()
+                $pipe = $null
+            } catch { $answer = "error: $($_.Exception.Message)" }
+        }
+        $events = @()
+        foreach ($log in "System", "Application") {
+            $events += @(Get-WinEvent -FilterHashtable @{ LogName = $log; StartTime = $started } -ErrorAction SilentlyContinue |
+                Where-Object { $_.ProviderName -match "DriverFrameworks|WUDF|UMDF|Application Error|Windows Error Reporting" -or ($_.Message -match "WUDFHost|JauntIdd") } |
+                Select-Object -First 12 | ForEach-Object {
+                    $first = if ($_.Message) { (($_.Message -split "`r?`n") -join " ") } else { "" }
+                    if ($first.Length -gt 300) { $first = $first.Substring(0, 300) }
+                    "$log $($_.TimeCreated.ToString('HH:mm:ss')) $($_.ProviderName) $($_.Id): $first"
+                })
+        }
+        $deviceNow = @([JauntIddSetup]::FindDevices() | ForEach-Object { "$_ $((Get-PnpDevice -InstanceId $_ -ErrorAction SilentlyContinue).Status)" })
+        Step "after a connection with eight monitors closed: the pipe answers status, a new add works" `
+            ($still -and $answer -like "ok *" -and $addAfter -match '^ok \d+$' -and $removeAfter -eq "ok") `
+            ([ordered]@{ pipe = $still; status = $answer; add = $addAfter; remove = $removeAfter; devices = $deviceNow; events = $events })
     }
 
     # ---- removed ----------------------------------------------------------------------------------
