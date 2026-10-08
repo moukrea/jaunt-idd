@@ -36,10 +36,6 @@ struct Trace {
     std::atomic<uint32_t> DefaultModes{0}, TargetModes{0}, Commits{0}, CommitPaths{0}, ActivePaths{0};
     std::atomic<uint32_t> SwapChains{0}, Unassigned{0}, Frames{0}, RenderLow{0};
     std::atomic<long> RenderHigh{0}, Device{E_PENDING}, SetDevice{E_PENDING};
-    // The render adapter this driver named (IddCxAdapterSetRenderAdapter), if it named one.
-    std::atomic<uint32_t> PreferredLow{0};
-    std::atomic<long> PreferredHigh{0};
-    std::atomic<bool> Preferred{false};
     // What DXGI listed to the driver: "<vendor>:<device>:<flags>:<luid>,..." (written once, before
     // the pipe opens; "-": DXGI could not be asked).
     char Adapters[400] = "-";
