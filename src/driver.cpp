@@ -91,6 +91,34 @@ std::wstring WithStatus(const wchar_t* what, NTSTATUS status) {
     return text;
 }
 
+// The render adapter to name for this adapter's displays: on a computer whose render adapters are
+// all software ones (a virtual machine's Microsoft Basic Render Driver), the first of them, since
+// Windows may otherwise find no renderer for an indirect display there. With any hardware adapter,
+// none: Windows chooses (IddCx.h: "the driver can use Dxgi enumeration to find the required render
+// adapter LUID").
+bool SoftwareOnlyRenderer(LUID& chosen) {
+    ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        return false;
+    }
+    bool software = false;
+    ComPtr<IDXGIAdapter1> adapter;
+    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+        DXGI_ADAPTER_DESC1 desc = {};
+        if (SUCCEEDED(adapter->GetDesc1(&desc))) {
+            if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+                return false;  // a GPU: Windows chooses
+            }
+            if (!software) {
+                chosen = desc.AdapterLuid;
+                software = true;
+            }
+        }
+        adapter.Reset();
+    }
+    return software;
+}
+
 Driver* DriverOf(IDDCX_MONITOR monitor, uint32_t& id) {
     auto* context = WdfObjectGet_JauntMonitorContext(monitor);
     id = context->MonitorId;
@@ -351,6 +379,16 @@ void Driver::InitAdapter() {
 }
 
 void Driver::FinishInit() {
+    // Before any monitor, as IddCx.h recommends.
+    LUID renderer = {};
+    if (m_Adapter != nullptr && SoftwareOnlyRenderer(renderer)) {
+        IDARG_IN_ADAPTERSETRENDERADAPTER preferred = {};
+        preferred.PreferredRenderAdapter = renderer;
+        IddCxAdapterSetRenderAdapter(m_Adapter, &preferred);
+        trace.PreferredLow = renderer.LowPart;
+        trace.PreferredHigh = renderer.HighPart;
+        trace.Preferred = true;
+    }
     // No monitor until the agent asks for one: the control pipe, open to SYSTEM and the account
     // the installer named.
     m_Pipe = std::make_unique<ControlPipe>(this, AllowedSid(m_WdfDevice));
@@ -527,13 +565,17 @@ std::string Driver::Status() {
         std::lock_guard<std::mutex> lock(m_Lock);
         monitors = m_Monitors.size();
     }
-    char text[512];
+    char preferred[32] = "none";
+    if (trace.Preferred) {
+        snprintf(preferred, sizeof(preferred), "%08X:%08X", static_cast<unsigned>(trace.PreferredHigh.load()), trace.PreferredLow.load());
+    }
+    char text[600];
     snprintf(text, sizeof(text),
              "ok adapter=0x%08X monitors=%u modes=%u targets=%u commits=%u paths=%u active=%u swapchains=%u render=%08X:%08X device=0x%08X "
-             "setdevice=0x%08X frames=%u unassigned=%u\n",
+             "setdevice=0x%08X frames=%u unassigned=%u preferred=%s\n",
              static_cast<unsigned>(m_AdapterStatus), static_cast<unsigned>(monitors), trace.DefaultModes.load(), trace.TargetModes.load(),
              trace.Commits.load(), trace.CommitPaths.load(), trace.ActivePaths.load(), trace.SwapChains.load(),
              static_cast<unsigned>(trace.RenderHigh.load()), trace.RenderLow.load(), static_cast<unsigned>(trace.Device.load()),
-             static_cast<unsigned>(trace.SetDevice.load()), trace.Frames.load(), trace.Unassigned.load());
+             static_cast<unsigned>(trace.SetDevice.load()), trace.Frames.load(), trace.Unassigned.load(), preferred);
     return text;
 }
