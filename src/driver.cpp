@@ -2,7 +2,9 @@
 // follow Microsoft's IddSampleDriver (Windows-driver-samples, video/IndirectDisplay, MIT; NOTICE.md).
 // SPDX-License-Identifier: MIT
 #include "driver.h"
+#include "protocol.h"
 
+#include <cwchar>
 #include <string>
 
 using namespace Microsoft::WRL;
@@ -46,14 +48,14 @@ std::wstring AllowedSid(WDFDEVICE device) {
     return sid.rfind(L"S-1-", 0) == 0 ? sid : L"";
 }
 
-IDDCX_MONITOR_MODE MonitorMode(uint32_t width, uint32_t height, uint32_t refresh) {
-    IDDCX_MONITOR_MODE mode = {};
-    mode.Size = sizeof(mode);
-    mode.Origin = IDDCX_MONITOR_MODE_ORIGIN_DRIVER;
-    DISPLAYCONFIG_VIDEO_SIGNAL_INFO& s = mode.MonitorVideoSignalInfo;
+// A mode's signal. IddCx.h: a monitor mode's vSyncFreqDivider has to be zero, a target mode's cannot
+// be (the desktop is updated at vSyncFreq / vSyncFreqDivider); Windows refuses a monitor whose
+// modes break this, when it arrives.
+DISPLAYCONFIG_VIDEO_SIGNAL_INFO SignalInfo(uint32_t width, uint32_t height, uint32_t refresh, UINT32 divider) {
+    DISPLAYCONFIG_VIDEO_SIGNAL_INFO s = {};
     s.totalSize.cx = s.activeSize.cx = width;
     s.totalSize.cy = s.activeSize.cy = height;
-    s.AdditionalSignalInfo.vSyncFreqDivider = 1;
+    s.AdditionalSignalInfo.vSyncFreqDivider = divider;
     s.AdditionalSignalInfo.videoStandard = 255;
     s.vSyncFreq.Numerator = refresh;
     s.vSyncFreq.Denominator = 1;
@@ -61,14 +63,31 @@ IDDCX_MONITOR_MODE MonitorMode(uint32_t width, uint32_t height, uint32_t refresh
     s.hSyncFreq.Denominator = 1;
     s.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
     s.pixelRate = static_cast<UINT64>(refresh) * width * height;
+    return s;
+}
+
+IDDCX_MONITOR_MODE MonitorMode(uint32_t width, uint32_t height, uint32_t refresh) {
+    IDDCX_MONITOR_MODE mode = {};
+    mode.Size = sizeof(mode);
+    mode.Origin = IDDCX_MONITOR_MODE_ORIGIN_DRIVER;
+    mode.MonitorVideoSignalInfo = SignalInfo(width, height, refresh, 0);
     return mode;
 }
 
 IDDCX_TARGET_MODE TargetMode(uint32_t width, uint32_t height, uint32_t refresh) {
     IDDCX_TARGET_MODE mode = {};
     mode.Size = sizeof(mode);
-    mode.TargetVideoSignalInfo.targetVideoSignalInfo = MonitorMode(width, height, refresh).MonitorVideoSignalInfo;
+    mode.TargetVideoSignalInfo.targetVideoSignalInfo = SignalInfo(width, height, refresh, 1);
+    // As Microsoft's sample: the mode's pipeline rate (the adapter declares no limit).
+    mode.RequiredBandwidth = static_cast<UINT64>(refresh) * width * height;
     return mode;
+}
+
+// An error from a Windows call, with its status for the pipe: "<what> (0x<NTSTATUS>)".
+std::wstring WithStatus(const wchar_t* what, NTSTATUS status) {
+    wchar_t text[128];
+    swprintf_s(text, L"%ls (0x%08X)", what, static_cast<unsigned>(status));
+    return text;
 }
 
 Driver* DriverOf(IDDCX_MONITOR monitor, uint32_t& id) {
@@ -285,7 +304,7 @@ Driver::~Driver() {
 void Driver::InitAdapter() {
     IDDCX_ADAPTER_CAPS caps = {};
     caps.Size = sizeof(caps);
-    caps.MaxMonitorsSupported = 8;
+    caps.MaxMonitorsSupported = MAX_MONITORS;
     caps.EndPointDiagnostics.Size = sizeof(caps.EndPointDiagnostics);
     caps.EndPointDiagnostics.GammaSupport = IDDCX_FEATURE_IMPLEMENTATION_NONE;
     caps.EndPointDiagnostics.TransmissionType = IDDCX_TRANSMISSION_TYPE_WIRED_OTHER;
@@ -305,7 +324,8 @@ void Driver::InitAdapter() {
     init.pCaps = &caps;
     init.ObjectAttributes = &attributes;
     IDARG_OUT_ADAPTER_INIT out = {};
-    if (NT_SUCCESS(IddCxAdapterInitAsync(&init, &out))) {
+    m_AdapterStatus = IddCxAdapterInitAsync(&init, &out);
+    if (NT_SUCCESS(m_AdapterStatus)) {
         m_Adapter = out.AdapterObject;
         WdfObjectGet_JauntDeviceContext(out.AdapterObject)->pDriver = this;
     }
@@ -320,15 +340,27 @@ void Driver::FinishInit() {
 uint32_t Driver::AddMonitor(uint32_t width, uint32_t height, uint32_t refresh, uint32_t connection, std::wstring& error) {
     std::unique_lock<std::mutex> lock(m_Lock);
     if (m_Adapter == nullptr) {
-        error = L"the adapter is not ready";
+        error = WithStatus(L"the adapter is not ready", m_AdapterStatus);
         return 0;
     }
-    if (m_Monitors.size() >= 8) {
-        error = L"too many monitors";
+    // The lowest connector free: a monitor removed (asked, or its connection gone) frees its own.
+    uint32_t connector = MAX_MONITORS;
+    for (uint32_t c = 0; c < MAX_MONITORS && connector == MAX_MONITORS; ++c) {
+        bool used = false;
+        for (auto& m : m_Monitors) {
+            used = used || m->Connector == c;
+        }
+        if (!used) {
+            connector = c;
+        }
+    }
+    if (connector == MAX_MONITORS) {
+        error = L"no free connector";
         return 0;
     }
     auto monitor = std::make_unique<Monitor>();
     monitor->Id = m_NextId++;
+    monitor->Connector = connector;
     monitor->Width = width;
     monitor->Height = height;
     monitor->Refresh = refresh;
@@ -339,7 +371,7 @@ uint32_t Driver::AddMonitor(uint32_t width, uint32_t height, uint32_t refresh, u
     IDDCX_MONITOR_INFO info = {};
     info.Size = sizeof(info);
     info.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED;
-    info.ConnectorIndex = monitor->Id;
+    info.ConnectorIndex = connector;  // 0 to MaxMonitorsSupported - 1 (IddCx.h)
     info.MonitorDescription.Size = sizeof(info.MonitorDescription);
     info.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
     info.MonitorDescription.DataSize = 0;  // no EDID: its modes come from the callbacks
@@ -355,7 +387,7 @@ uint32_t Driver::AddMonitor(uint32_t width, uint32_t height, uint32_t refresh, u
     NTSTATUS status = IddCxMonitorCreate(m_Adapter, &create, &created);
     if (!NT_SUCCESS(status)) {
         m_Monitors.pop_back();
-        error = L"IddCxMonitorCreate failed";
+        error = WithStatus(L"IddCxMonitorCreate failed", status);
         return 0;
     }
     raw->Object = created.MonitorObject;
@@ -375,13 +407,13 @@ uint32_t Driver::AddMonitor(uint32_t width, uint32_t height, uint32_t refresh, u
             }
         }
         WdfObjectDelete(reinterpret_cast<WDFOBJECT>(created.MonitorObject));
-        error = L"IddCxMonitorArrival failed";
+        error = WithStatus(L"IddCxMonitorArrival failed", status);
         return 0;
     }
     return id;
 }
 
-bool Driver::RemoveMonitor(uint32_t id, uint32_t connection) {
+bool Driver::RemoveMonitor(uint32_t id, uint32_t connection, std::wstring& error) {
     IDDCX_MONITOR object = nullptr;
     {
         std::lock_guard<std::mutex> lock(m_Lock);
@@ -396,9 +428,14 @@ bool Driver::RemoveMonitor(uint32_t id, uint32_t connection) {
         }
     }
     if (object == nullptr) {
+        error = L"no such monitor of this connection";
         return false;
     }
-    IddCxMonitorDeparture(object);
+    NTSTATUS status = IddCxMonitorDeparture(object);
+    if (!NT_SUCCESS(status)) {
+        error = WithStatus(L"IddCxMonitorDeparture failed", status);
+        return false;
+    }
     return true;
 }
 
@@ -413,7 +450,8 @@ void Driver::RemoveConnection(uint32_t connection) {
         }
     }
     for (uint32_t id : ids) {
-        RemoveMonitor(id, connection);
+        std::wstring ignored;  // the connection is gone: no one to tell
+        RemoveMonitor(id, connection, ignored);
     }
 }
 

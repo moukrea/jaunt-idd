@@ -66,6 +66,29 @@ public static class JauntIddDisplays
     static extern bool EnumDisplayDevicesW(string lpDevice, int iDevNum, ref DISPLAY_DEVICE lpDisplayDevice, int dwFlags);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     static extern bool EnumDisplaySettingsW(string lpszDeviceName, int iModeNum, ref DEVMODE lpDevMode);
+    [DllImport("user32.dll")]
+    static extern int SetDisplayConfig(uint numPathArrayElements, IntPtr pathArray, uint numModeInfoArrayElements, IntPtr modeInfoArray, uint flags);
+
+    // Every display device, attached or not: "<name> <string> flags 0x<StateFlags>".
+    public static string[] All()
+    {
+        List<string> found = new List<string>();
+        DISPLAY_DEVICE device = new DISPLAY_DEVICE();
+        device.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE));
+        for (int i = 0; EnumDisplayDevicesW(null, i, ref device, 0); i++)
+        {
+            found.Add(device.DeviceName + " " + device.DeviceString + " flags 0x" + device.StateFlags.ToString("X"));
+            device.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE));
+        }
+        return found.ToArray();
+    }
+
+    // The desktop extended over every display connected (SDC_TOPOLOGY_EXTEND | SDC_APPLY): what
+    // Windows answers (0: done).
+    public static int Extend()
+    {
+        return SetDisplayConfig(0, IntPtr.Zero, 0, IntPtr.Zero, 0x4 | 0x80);
+    }
 
     public static string[] Attached()
     {
@@ -122,6 +145,18 @@ function Connect {
 # removes the monitors of a connection silent for 5 s).
 function WaitAlive($aliveConnection, [scriptblock]$aliveTest, [int]$aliveSeconds) {
     WaitFor { $null = Ask $aliveConnection "ping"; & $aliveTest } $aliveSeconds
+}
+# A monitor that arrived, listed by Windows: waited for, then once more after extending the desktop
+# over every display (what a monitor plugged in gets on a desktop that does it by itself). What
+# extending answered, if it was needed.
+function Appear($appearConnection, [string]$appearSize) {
+    $seen = WaitAlive $appearConnection { Shown $appearSize } 10
+    $extend = $null
+    if (-not $seen) {
+        $extend = [JauntIddDisplays]::Extend()
+        $seen = WaitAlive $appearConnection { Shown $appearSize } 10
+    }
+    [ordered]@{ listed = @($seen); extend = $extend }
 }
 # One request, its answer (at most 10 s).
 function Ask($pipe, [string]$request) {
@@ -184,35 +219,76 @@ try {
         $pipe = Connect
         $added = Ask $pipe "add 1170 2532 60"
         $listed = WaitAlive $pipe { Shown "1170x2532" } 20
+        # Not listed although it arrived: what Windows has, and what extending the desktop does.
+        $why = $null
+        if ($added -match '^ok \d+$' -and -not $listed) {
+            $why = [ordered]@{
+                devices = @([JauntIddDisplays]::All())
+                displayAdapters = @(Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | ForEach-Object { "$($_.FriendlyName) $($_.Status)" })
+                renderDevices = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object FriendlyName -match "Render" | ForEach-Object { "$($_.FriendlyName) $($_.Status)" })
+                extend = [JauntIddDisplays]::Extend()
+            }
+            $listed = WaitAlive $pipe { Shown "1170x2532" } 10
+            $why.listedAfterExtend = [bool]$listed
+            $why.devicesAfterExtend = @([JauntIddDisplays]::All())
+        }
         $id = if ($added -match '^ok (\d+)$') { $Matches[1] } else { "0" }
         $removed = Ask $pipe "remove $id"
         $gone = [bool](WaitAlive $pipe { -not (Shown "1170x2532").Count } 20)
         Step "a 1170x2532 monitor: added, listed, removed" ($added -match '^ok \d+$' -and $listed -and $removed -eq "ok" -and $gone) `
-            ([ordered]@{ add = $added; listed = @($listed); remove = $removed; gone = $gone })
+            ([ordered]@{ add = $added; listed = @($listed); notListed = $why; remove = $removed; gone = $gone })
         $pong = Ask $pipe "ping"
         $refused = Ask $pipe "add 100 100 60"
         Step "ping answered, a size out of range refused" ($pong -eq "pong" -and $refused -like "error *") ([ordered]@{ ping = $pong; add100 = $refused })
 
         # ---- a silent connection loses its monitor (the watchdog, 5 s) ---------------------------
         $added = Ask $pipe "add 1280 720 60"
-        $listed = WaitAlive $pipe { Shown "1280x720" } 20
+        $appeared = Appear $pipe "1280x720"
+        $listed = $appeared.listed | Where-Object { $_ }
         $silent = Get-Date  # nothing sent from here
         $gone = [bool](WaitFor { -not (Shown "1280x720").Count } 20)
         Step "a connection silent for 5 s: its monitor removed" ($added -match '^ok \d+$' -and $listed -and $gone) `
-            ([ordered]@{ add = $added; listed = @($listed); goneAfterSeconds = [math]::Round(((Get-Date) - $silent).TotalSeconds, 1) })
+            ([ordered]@{ add = $added; appeared = $appeared; goneAfterSeconds = [math]::Round(((Get-Date) - $silent).TotalSeconds, 1) })
         $pipe.Dispose()
         $pipe = $null
 
         # ---- a closed connection loses its monitor ----------------------------------------------
         $pipe = Connect
         $added = Ask $pipe "add 1366 768 60"
-        $listed = WaitAlive $pipe { Shown "1366x768" } 20
+        $appeared = Appear $pipe "1366x768"
+        $listed = $appeared.listed | Where-Object { $_ }
         $pipe.Dispose()
         $pipe = $null
         $closed = Get-Date
         $gone = [bool](WaitFor { -not (Shown "1366x768").Count } 10)
         Step "a closed connection: its monitor removed" ($added -match '^ok \d+$' -and $listed -and $gone) `
-            ([ordered]@{ add = $added; listed = @($listed); goneAfterSeconds = [math]::Round(((Get-Date) - $closed).TotalSeconds, 1) })
+            ([ordered]@{ add = $added; appeared = $appeared; goneAfterSeconds = [math]::Round(((Get-Date) - $closed).TotalSeconds, 1) })
+
+        # ---- connectors: each freed and taken again, eight at most -------------------------------
+        $pipe = Connect
+        $cycles = @()
+        foreach ($n in 1..9) {
+            $added = Ask $pipe "add 640 480 60"
+            $removed = if ($added -match '^ok (\d+)$') { Ask $pipe "remove $($Matches[1])" } else { "-" }
+            $cycles += "$added / $removed"
+        }
+        Step "nine monitors made and removed in a row: each accepted" (@($cycles | Where-Object { $_ -notmatch '^ok \d+ / ok$' }).Count -eq 0) ([ordered]@{ answers = $cycles })
+        $held = @()
+        $answers = @()
+        foreach ($n in 1..9) {
+            $added = Ask $pipe "add 640 480 60"
+            $answers += $added
+            if ($added -match '^ok (\d+)$') { $held += $Matches[1] }
+        }
+        $freed = if ($held.Count) { Ask $pipe "remove $($held[0])" } else { "-" }
+        $again = Ask $pipe "add 640 480 60"
+        Step "eight at once, the ninth refused, one freed and taken again" `
+            ($held.Count -eq 8 -and $answers[8] -eq "error no free connector" -and $freed -eq "ok" -and $again -match '^ok \d+$') `
+            ([ordered]@{ answers = $answers; remove = $freed; addAgain = $again })
+        $pipe.Dispose()
+        $pipe = $null
+        $gone = [bool](WaitFor { -not (Shown "640x480").Count } 15)
+        Step "that connection closed: its eight monitors removed" $gone ([ordered]@{ displays = @([JauntIddDisplays]::Attached()) })
     }
 
     # ---- removed ----------------------------------------------------------------------------------

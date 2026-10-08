@@ -122,9 +122,11 @@ void ControlPipe::Serve(HANDLE pipe, uint32_t connection) {
                 answer = id ? Ok(id) : Error(Narrow(error));
                 break;
             }
-            case Kind::Remove:
-                answer = m_Driver->RemoveMonitor(c.id, connection) ? Ok() : Error("no such monitor of this connection");
+            case Kind::Remove: {
+                std::wstring error;
+                answer = m_Driver->RemoveMonitor(c.id, connection, error) ? Ok() : Error(Narrow(error));
                 break;
+            }
             case Kind::Ping:
                 answer = Pong();
                 break;

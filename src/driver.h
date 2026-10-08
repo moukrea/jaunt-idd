@@ -66,6 +66,7 @@ struct Monitor {
     uint32_t Height = 0;
     uint32_t Refresh = 60;
     uint32_t Connection = 0;
+    uint32_t Connector = 0;  // the adapter's connector: 0 to MAX_MONITORS - 1, free again once it goes
     IDDCX_MONITOR Object = nullptr;
     std::unique_ptr<SwapChainProcessor> Processor;
 };
@@ -80,7 +81,8 @@ public:
 
     // Control pipe (control.cpp): a monitor of that mode for connection `connection`; its id, or 0.
     uint32_t AddMonitor(uint32_t width, uint32_t height, uint32_t refresh, uint32_t connection, std::wstring& error);
-    bool RemoveMonitor(uint32_t id, uint32_t connection);
+    // Its error when it is not removed, or when Windows refused its departure (it is gone here).
+    bool RemoveMonitor(uint32_t id, uint32_t connection, std::wstring& error);
     void RemoveConnection(uint32_t connection);
 
     // IddCx callbacks.
@@ -93,6 +95,7 @@ public:
 private:
     WDFDEVICE m_WdfDevice;
     IDDCX_ADAPTER m_Adapter = nullptr;
+    NTSTATUS m_AdapterStatus = STATUS_PENDING;  // what IddCxAdapterInitAsync answered
     std::mutex m_Lock;
     std::vector<std::unique_ptr<Monitor>> m_Monitors;
     uint32_t m_NextId = 1;

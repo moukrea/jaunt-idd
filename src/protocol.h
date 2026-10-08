@@ -21,6 +21,8 @@ constexpr uint32_t MAX_SIDE = 8192;
 constexpr uint32_t MIN_REFRESH = 24;
 constexpr uint32_t MAX_REFRESH = 240;
 constexpr uint32_t WATCHDOG_MS = 5000;
+// Monitors at once: the adapter's connectors 0 to MAX_MONITORS - 1, each reused once free.
+constexpr uint32_t MAX_MONITORS = 8;
 constexpr size_t MAX_MESSAGE = 256;
 
 enum class Kind { Add, Remove, Ping, Invalid };
