@@ -33,6 +33,9 @@ Driver (NOTICE.md).
 
        powershell -ExecutionPolicy Bypass -File install.ps1
 
+   For an unsigned release (all of them until SignPath Foundation signs one), add `-SignLocally`
+   (below).
+
 `install.ps1` says what it changes and asks before changing anything:
 
 - the driver package goes into Windows' driver store, and a device "jaunt virtual display" is added
@@ -41,14 +44,40 @@ Driver (NOTICE.md).
   /user` prints yours) may ask the driver for monitors;
 - its files are kept in `C:\Program Files\jaunt-idd`, with an entry in Settings > Apps to remove it.
 
-Windows then asks whether to install device software from the package's publisher ("SignPath
-Foundation" for a signed release): that is this driver. `install.ps1` installs only a package whose
-signature Windows accepts, never an unsigned one. It never turns on test-signing mode; on a
-computer already in that mode, `-TestSigning` also accepts a build signed with a test certificate
-(see Test plan).
+For a signed release, Windows then asks whether to install device software from its publisher
+("SignPath Foundation"): that is this driver. `install.ps1` installs only a package whose catalog
+Windows accepts the signature of, never an unsigned one (the DLL, if not signed itself, is in the
+catalog, and Windows checks it as it installs). It never turns on test-signing mode; on a computer
+already in that mode, `-TestSigning` also accepts a build signed with a test certificate (see Test
+plan).
+
+### An unsigned release: `-SignLocally`
+
+`install.ps1 -SignLocally` installs an unsigned release by making this computer trust a certificate
+made on it, for it alone. It says so and asks first, then:
+
+1. makes a certificate, "CN=jaunt indirect display driver (<computer name>)", valid 2 years, that
+   can sign code only: its only usage is code signing, and it is not a certificate authority, so it
+   cannot vouch for any other certificate. Its private key is in the computer's store, not
+   exportable;
+2. adds its public part to the computer's Trusted Root Certification Authorities and Trusted
+   Publishers, so Windows accepts what it signed without asking;
+3. signs the package's catalog with it (the catalog holds the DLL's and the INF's hashes);
+4. **deletes its private key**, before the driver is installed: nothing else can ever be signed with
+   it, on this computer or elsewhere;
+5. installs the driver as above.
+
+If any step fails, everything it did is undone. Uninstalling removes that certificate from both
+stores. A catalog that is already signed is never signed again: a signed release needs no
+`-SignLocally`, and a catalog signed by someone Windows does not trust is refused.
+
+This trusts a certificate nobody else has seen, which is what SignPath Foundation's signature avoids:
+signed releases stay the preferred way, and `jaunt remote-desktop driver install` uses one as soon as
+one exists.
 
 jaunt installs it for you with `jaunt remote-desktop driver install`, which downloads a release whose
-SHA-256 jaunt knows, checks its signature, shows the same changes and asks you first.
+SHA-256 jaunt knows, shows the same changes (the certificate made here included, for an unsigned
+release) and asks you first, then runs `install.ps1` as an administrator.
 
 ## Uninstall
 
@@ -57,7 +86,8 @@ Settings > Apps > "jaunt indirect display driver" > Uninstall, or as an administ
     powershell -ExecutionPolicy Bypass -File "C:\Program Files\jaunt-idd\uninstall.ps1"
 
 It lists what it removes and asks first: the device (any monitor it shows goes at once), the driver
-package in Windows' driver store, `C:\Program Files\jaunt-idd` and the Settings > Apps entry.
+package in Windows' driver store, `C:\Program Files\jaunt-idd`, the Settings > Apps entry, and the
+certificate `-SignLocally` made, from the trusted stores.
 `jaunt remote-desktop driver uninstall` runs it.
 
 ## Protocol
@@ -98,8 +128,7 @@ computer that cannot load the driver can (CI runs both, `.github/workflows/ci.ym
 A tag `vMAJOR.MINOR.PATCH` releases the driver (`.github/workflows/release.yml`): built on GitHub's
 runners for x64 and ARM64, then signed through SignPath Foundation (below), with `SHA256SUMS`.
 Until this repository's signing is set up, a release is published unsigned, as a pre-release titled
-"unsigned, test-signing only": `install.ps1` refuses it as published; to try it, sign it with a
-test certificate on a computer in test-signing mode.
+"unsigned": `install.ps1 -SignLocally` installs it (above), and plain `install.ps1` refuses it.
 
 ## Test plan
 

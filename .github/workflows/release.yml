@@ -4,9 +4,8 @@
 #   SIGNPATH_API_TOKEN and the variable SIGNPATH_ORGANIZATION_ID; README.md, "Code signing
 #   policy"): the DLL first, then the catalog Inf2Cat makes over the signed DLL. A maintainer
 #   approves each signing request in SignPath.
-# - Until then, released unsigned as a pre-release titled "unsigned, test-signing only": Windows
-#   loads it only once signed with a test certificate, in test-signing mode; install.ps1 refuses it
-#   as published.
+# - Until then, released unsigned as a pre-release titled "unsigned": install.ps1 -SignLocally
+#   installs it with a certificate made for that computer alone; plain install.ps1 refuses it.
 # The release holds jaunt-idd-x64.zip, jaunt-idd-ARM64.zip and their SHA256SUMS.
 # SPDX-License-Identifier: MIT
 name: release
@@ -161,8 +160,8 @@ jobs:
             signing="Signed through SignPath Foundation: free code signing provided by SignPath.io, certificate by SignPath Foundation. When installing it, Windows asks whether to install device software from \"SignPath Foundation\"."
             flags=""
           else
-            title="jaunt-idd $VERSION (unsigned, test-signing only)"
-            signing="**Unsigned, for test-signing only.** install.ps1 refuses this build as published: to try it, sign it with a test certificate on a computer in test-signing mode. Signed releases come through SignPath Foundation, under the code signing policy below."
+            title="jaunt-idd $VERSION (unsigned)"
+            signing="**Unsigned.** Install it with \`install.ps1 -SignLocally\`: a certificate made on the computer, for it alone and able to sign code only, signs the package's catalog and is trusted there, and its private key is deleted before the driver is installed (README, \"An unsigned release\"); uninstalling removes it. Plain \`install.ps1\` refuses this build. Signed releases come through SignPath Foundation, under the code signing policy below."
             flags="--prerelease"
           fi
           VERSION="$VERSION" SIGNING="$signing" python3 -c 'import os, sys; t = open(".github/release-notes.md").read(); sys.stdout.write(t.replace("{version}", os.environ["VERSION"]).replace("{signing}", os.environ["SIGNING"]))' > notes.md

@@ -1,11 +1,13 @@
-# Load the driver on GitHub's own Windows runner, use it, and remove it. The runner boots in
-# test-signing mode: this signs the package with a throwaway test certificate made here, installs it
-# with install.ps1 -TestSigning, adds and removes a monitor through the pipe, checks that a silent
-# connection and a closed one lose their monitors, then runs uninstall.ps1.
+# Load the driver on GitHub's own Windows runner, use it, and remove it: installs the unsigned package
+# as people install an unsigned release, install.ps1 -SignLocally (a certificate made for this
+# computer signs its catalog, is trusted, and loses its private key), checks that certificate, adds
+# and removes monitors through the pipe, checks that a silent connection and a closed one lose
+# theirs, then runs uninstall.ps1, which removes the certificate too. The runner boots in
+# test-signing mode, so this does not show that the driver loads without it.
 # It runs nowhere else: only where GITHUB_ACTIONS is true and RUNNER_ENVIRONMENT is github-hosted, on
 # a computer already in test-signing mode (this never turns that mode on), as an administrator,
-# with no jaunt-idd installed. The certificate's private key cannot be exported and never leaves
-# this run; the certificate leaves the machine's stores at the end, whatever happened.
+# with no jaunt-idd installed. The certificate install.ps1 makes loses its private key before the
+# driver is installed; it leaves the machine's stores at the end, whatever happened.
 #   powershell -NoProfile -NonInteractive -InputFormat None -ExecutionPolicy Bypass -File tests\load_test.ps1 -Package out\x64\package [-Then <script.ps1>]
 # -Then: a script run with the driver installed, before it is removed (a program that uses the
 # driver checks itself there); its exit code and output are a step.
@@ -276,45 +278,40 @@ function Ask($pipe, [string]$request) {
 
 $started = Get-Date
 $work = Join-Path ([IO.Path]::GetTempPath()) ("jaunt-idd-load-" + [guid]::NewGuid())
-$cert = $null
+$thumb = $null
 $pipe = $null
 try {
-    # ---- the throwaway certificate, trusted on this machine only ----------------------------
-    $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=jaunt-idd CI throwaway test certificate" -CertStoreLocation "Cert:\LocalMachine\My" `
-        -KeyExportPolicy NonExportable -NotAfter (Get-Date).AddHours(3)
-    $public = New-Object Security.Cryptography.X509Certificates.X509Certificate2(, $cert.RawData)
-    foreach ($name in "Root", "TrustedPublisher") {
-        $store = New-Object Security.Cryptography.X509Certificates.X509Store($name, "LocalMachine")
-        $store.Open("ReadWrite")
-        $store.Add($public)
-        $store.Close()
-    }
-    Step "a throwaway test certificate, trusted on this runner" $true ([ordered]@{ subject = $cert.Subject; notAfter = $cert.NotAfter.ToString("u") })
-
-    # ---- the package signed with it: the DLL, the catalog made again over it, the catalog ------
+    # ---- installed as people install an unsigned release: install.ps1 -SignLocally -------------
     New-Item -ItemType Directory -Force $work | Out-Null
     Copy-Item -Recurse $Package (Join-Path $work "package")
-    $driver = Join-Path $work "package\driver"
-    function Sign([string]$file) {
-        $signed = Set-AuthenticodeSignature -FilePath $file -Certificate $cert -HashAlgorithm SHA256
-        if ($signed.Status -eq "Valid") { return "Set-AuthenticodeSignature" }
-        # Else the SDK's signtool, which the runner has.
-        $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
-        if (-not $signtool) { throw "$(Split-Path -Leaf $file): $($signed.Status) ($($signed.StatusMessage)), and no signtool" }
-        & $signtool.FullName sign /sha1 $cert.Thumbprint /sm /s My /fd sha256 $file | Out-Null
-        return "signtool"
-    }
-    $dllBy = Sign (Join-Path $driver "JauntIdd.dll")
-    $catalog = & (Join-Path $root "catalog.ps1") -Driver $driver -Platform x64 | Select-Object -Last 1
-    $catBy = Sign (Join-Path $driver "jaunt-idd.cat")
-    $signatures = @("jaunt-idd.cat", "JauntIdd.dll") | ForEach-Object { "$_ $((Get-AuthenticodeSignature (Join-Path $driver $_)).Status)" }
-    Step "the package signed with it" (@($signatures | Where-Object { $_ -notmatch " Valid$" }).Count -eq 0) ([ordered]@{ signatures = $signatures; dll = $dllBy; catalog = $catBy; catalogMade = $catalog })
-
-    # ---- installed ------------------------------------------------------------------------------
+    $before = @("jaunt-idd.cat", "JauntIdd.dll") | ForEach-Object { "$_ $((Get-AuthenticodeSignature (Join-Path $work "package\driver\$_")).Status)" }
     $displaysBefore = @([JauntIddDisplays]::Attached())
-    $code = RunScript (Join-Path $work "package\install.ps1") @("-Yes", "-TestSigning", "-Result", (Join-Path $work "install.json")) 300
+    $code = RunScript (Join-Path $work "package\install.ps1") @("-Yes", "-SignLocally", "-Result", (Join-Path $work "install.json")) 300
     $install = ReadReport (Join-Path $work "install.json")
-    Step "install.ps1 -TestSigning" ($code -eq 0 -and $install -and $install.installed) ([ordered]@{ exitCode = $code; report = $install })
+    Step "install.ps1 -SignLocally" ($code -eq 0 -and $install -and $install.installed -and $install.signedLocally) ([ordered]@{ exitCode = $code; before = $before; report = $install })
+    # What it left: a certificate trusted, code signing only, not a CA, without a private key anywhere;
+    # the installed catalog signed with it, the DLL as it came.
+    $thumb = if ($install) { $install.localCertificate } else { $null }
+    $localCert = $null
+    if ($thumb) {
+        $localCert = Get-ChildItem Cert:\LocalMachine\Root | Where-Object Thumbprint -eq $thumb | Select-Object -First 1
+        $usages = @($localCert.Extensions | Where-Object { $_ -is [Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] } | ForEach-Object { $_.EnhancedKeyUsages } | ForEach-Object { $_.Value })
+        $constraints = @($localCert.Extensions | Where-Object { $_ -is [Security.Cryptography.X509Certificates.X509BasicConstraintsExtension] })
+        $installed = Join-Path $env:ProgramFiles "jaunt-idd\driver"
+        $made = [ordered]@{
+            subject = $localCert.Subject
+            notAfter = $localCert.NotAfter.ToString("u")
+            usages = $usages
+            ca = $(if ($constraints.Count) { $constraints[0].CertificateAuthority } else { "unsaid" })
+            stores = @("Root", "TrustedPublisher", "My" | Where-Object { Test-Path "Cert:\LocalMachine\$_\$thumb" })
+            privateKey = @("Root", "TrustedPublisher", "My" | Where-Object { (Test-Path "Cert:\LocalMachine\$_\$thumb") -and (Get-Item "Cert:\LocalMachine\$_\$thumb").HasPrivateKey })
+            catalog = "$((Get-AuthenticodeSignature (Join-Path $installed 'jaunt-idd.cat')).Status) $((Get-AuthenticodeSignature (Join-Path $installed 'jaunt-idd.cat')).SignerCertificate.Thumbprint)"
+            dll = "$((Get-AuthenticodeSignature (Join-Path $installed 'JauntIdd.dll')).Status)"
+        }
+        $good = $localCert -and ($usages -join ",") -eq "1.3.6.1.5.5.7.3.3" -and $made.ca -eq $false -and ($made.stores -join ",") -eq "Root,TrustedPublisher" `
+            -and -not $made.privateKey.Count -and $made.catalog -eq "Valid $thumb" -and $localCert.Subject -eq "CN=jaunt indirect display driver ($env:COMPUTERNAME)"
+        Step "the certificate made: code signing only, not a CA, trusted, its private key gone; the catalog signed with it" $good $made
+    }
     $devices = @([JauntIddSetup]::FindDevices())
     $status = @($devices | ForEach-Object { "$_ $((Get-PnpDevice -InstanceId $_ -ErrorAction SilentlyContinue).Status)" })
     $pipeThere = [bool](WaitFor { PipeThere } 30)
@@ -470,7 +467,9 @@ try {
     $uninstall = ReadReport (Join-Path $work "uninstall.json")
     $left = [ordered]@{ devices = @([JauntIddSetup]::FindDevices()).Count; pipe = (PipeThere); folder = (Test-Path (Join-Path $env:ProgramFiles "jaunt-idd"))
                         appsEntry = (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\jaunt-idd") }
-    Step "uninstall.ps1: nothing left" ($code -eq 0 -and $uninstall -and $uninstall.removed -and -not $left.devices -and -not $left.folder -and -not $left.appsEntry) `
+    $left.certificate = if ($thumb) { @("Root", "TrustedPublisher", "My" | Where-Object { Test-Path "Cert:\LocalMachine\$_\$thumb" }) } else { @() }
+    Step "uninstall.ps1: nothing left, the certificate made here included" `
+        ($code -eq 0 -and $uninstall -and $uninstall.removed -and -not $left.devices -and -not $left.folder -and -not $left.appsEntry -and -not $left.certificate.Count) `
         ([ordered]@{ exitCode = $code; report = $uninstall; left = $left })
 } catch {
     Step "stopped" $false $_.Exception.Message
@@ -481,15 +480,11 @@ try {
         $uninstaller = @((Join-Path $env:ProgramFiles "jaunt-idd\uninstall.ps1"), (Join-Path $work "package\uninstall.ps1")) | Where-Object { Test-Path $_ } | Select-Object -First 1
         if ($uninstaller) { $null = RunScript $uninstaller @("-Yes") 300 }
     }
-    if ($cert) {
-        foreach ($name in "My", "Root", "TrustedPublisher") {
-            $store = New-Object Security.Cryptography.X509Certificates.X509Store($name, "LocalMachine")
-            $store.Open("ReadWrite")
-            foreach ($found in @($store.Certificates.Find("FindByThumbprint", $cert.Thumbprint, $false))) { $store.Remove($found) }
-            $store.Close()
-        }
-        $left = @(Get-ChildItem Cert:\LocalMachine\Root, Cert:\LocalMachine\TrustedPublisher, Cert:\LocalMachine\My | Where-Object Thumbprint -eq $cert.Thumbprint)
-        Step "the certificate removed from the machine's stores" (-not $left.Count) $null
+    # And any certificate install.ps1 -SignLocally made here (it did not record one if it failed).
+    $localSubject = "CN=jaunt indirect display driver ($env:COMPUTERNAME)"
+    foreach ($name in "My", "Root", "TrustedPublisher") {
+        Get-ChildItem "Cert:\LocalMachine\$name" -ErrorAction SilentlyContinue | Where-Object { $_.Subject -eq $localSubject -or ($thumb -and $_.Thumbprint -eq $thumb) } |
+            ForEach-Object { if ($name -eq "My") { Remove-Item $_.PSPath -DeleteKey -ErrorAction SilentlyContinue } else { Remove-Item $_.PSPath -ErrorAction SilentlyContinue } }
     }
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
 }
