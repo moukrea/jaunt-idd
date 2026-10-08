@@ -6,6 +6,9 @@
 # Exit codes: 0 removed (or nothing to remove), 1 failed, 2 declined, 4 not an administrator.
 # SPDX-License-Identifier: MIT
 param([switch]$Yes, [string]$Result = "")
+# This PowerShell's own modules first: started from PowerShell 7, Windows PowerShell inherits its
+# PSModulePath and finds none of its script-defined commands (Get-FileHash, Expand-Archive).
+$env:PSModulePath = "$PSHOME\Modules;$env:PSModulePath"
 $ErrorActionPreference = "Stop"
 $report = [ordered]@{ action = "uninstall"; removed = $false; devices = @(); driverPackages = @(); error = $null }
 
