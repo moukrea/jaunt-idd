@@ -213,6 +213,32 @@ try {
         $gone = [bool](WaitFor { -not (Shown "1366x768").Count } 10)
         Step "a closed connection: its monitor removed" ($added -match '^ok \d+$' -and $listed -and $gone) `
             ([ordered]@{ add = $added; listed = @($listed); goneAfterSeconds = [math]::Round(((Get-Date) - $closed).TotalSeconds, 1) })
+
+        # ---- connectors: each freed and taken again, eight at most -------------------------------
+        $pipe = Connect
+        $cycles = @()
+        foreach ($n in 1..9) {
+            $added = Ask $pipe "add 640 480 60"
+            $removed = if ($added -match '^ok (\d+)$') { Ask $pipe "remove $($Matches[1])" } else { "-" }
+            $cycles += "$added / $removed"
+        }
+        Step "nine monitors made and removed in a row: each accepted" (@($cycles | Where-Object { $_ -notmatch '^ok \d+ / ok$' }).Count -eq 0) ([ordered]@{ answers = $cycles })
+        $held = @()
+        $answers = @()
+        foreach ($n in 1..9) {
+            $added = Ask $pipe "add 640 480 60"
+            $answers += $added
+            if ($added -match '^ok (\d+)$') { $held += $Matches[1] }
+        }
+        $freed = if ($held.Count) { Ask $pipe "remove $($held[0])" } else { "-" }
+        $again = Ask $pipe "add 640 480 60"
+        Step "eight at once, the ninth refused, one freed and taken again" `
+            ($held.Count -eq 8 -and $answers[8] -eq "error no free connector" -and $freed -eq "ok" -and $again -match '^ok \d+$') `
+            ([ordered]@{ answers = $answers; remove = $freed; addAgain = $again })
+        $pipe.Dispose()
+        $pipe = $null
+        $gone = [bool](WaitFor { -not (Shown "640x480").Count } 15)
+        Step "that connection closed: its eight monitors removed" $gone ([ordered]@{ displays = @([JauntIddDisplays]::Attached()) })
     }
 
     # ---- removed ----------------------------------------------------------------------------------

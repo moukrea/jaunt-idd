@@ -11,7 +11,8 @@ Driver (NOTICE.md).
 - Windows 10 version 1903 (build 18362) or later, x64 or ARM64: IddCx 1.4, UMDF 2.25.
 - No monitor until a program asks for one. The driver listens on a named pipe,
   `\\.\pipe\jaunt-idd`, and adds a monitor of the mode it is given (320 to 8192 pixels a side, 24
-  to 240 Hz), without an EDID: Windows takes the driver's mode list, so any size works.
+  to 240 Hz), without an EDID: Windows takes the driver's mode list, so any size works. Up to 8
+  monitors at once, one per connector of the adapter; a monitor that goes frees its connector.
 - **Who may ask:** the pipe's security descriptor lets SYSTEM and one account open it, the one named
   at installation (`AllowedUser`, a SID, in the device's hardware key). No one else: not Everyone,
   not Administrators, not remote clients (`PIPE_REJECT_REMOTE_CLIENTS`). Without that value, SYSTEM
@@ -69,7 +70,9 @@ One request per pipe message, one answer each (UTF-8 text):
 | `remove <id>` | `ok` |
 | `ping` | `pong` |
 
-Anything else, or a value out of range: `error <why>`. `src/protocol.cpp`, tested on its own by
+Anything else, or a value out of range: `error <why>`. A ninth monitor at once: `error no free
+connector`. When Windows refuses a call, the error ends with its NTSTATUS, e.g. `error
+IddCxMonitorArrival failed (0xC0000001)`. `src/protocol.cpp`, tested on its own by
 `tests/protocol_test.cpp` (any C++17 compiler).
 
 ## Build
