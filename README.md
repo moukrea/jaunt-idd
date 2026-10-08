@@ -77,8 +77,8 @@ IddCxMonitorArrival failed (0xC0000001)`. `status` says what Windows asked of th
 it asked for monitor and target modes, committed modes (with how many paths, how many active)
 and assigned swap chains, the render adapter of the last one, the results of making its D3D
 device and handing it over (`0x8000000A`: not yet), the frames received, and the render adapter
-the driver named (`none`: Windows chooses; on a computer without a GPU, whose render adapters are
-all software ones, the driver names the first of them, as IddCx lets a driver do), and the render
+the driver named (`none`: Windows chooses; on a computer without a GPU, the driver names the
+software Basic Render Driver, as IddCx lets a driver do), and the render
 adapters DXGI listed to the driver (`vendor:device:flags:LUID`). `src/protocol.cpp`, tested on its own by
 `tests/protocol_test.cpp` (any C++17 compiler).
 

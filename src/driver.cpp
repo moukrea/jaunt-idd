@@ -92,11 +92,13 @@ std::wstring WithStatus(const wchar_t* what, NTSTATUS status) {
     return text;
 }
 
-// The render adapter to name for this adapter's displays: on a computer whose render adapters are
-// all software ones (a virtual machine's Microsoft Basic Render Driver, vendor 0x1414 device 0x8C),
-// the first of them, since Windows may otherwise find no renderer for an indirect display there.
-// With any hardware adapter, none: Windows chooses (IddCx.h: "the driver can use Dxgi enumeration to
-// find the required render adapter LUID"). What DXGI listed goes into `listed` for `status`.
+// The render adapter to name for this adapter's displays: on a computer without a GPU (a virtual
+// machine whose only renderer is the Microsoft Basic Render Driver), that software adapter, since
+// Windows may otherwise find no renderer for an indirect display there. A GPU is an adapter of another
+// vendor than Microsoft (0x1414): display-only and indirect adapters, this one included, show Basic
+// Render's ids without the software flag. With a GPU, none: Windows chooses (IddCx.h: "the driver
+// can use Dxgi enumeration to find the required render adapter LUID"). What DXGI listed goes into
+// `listed` for `status`.
 bool SoftwareOnlyRenderer(LUID& chosen, char* listed, size_t size) {
     ComPtr<IDXGIFactory1> factory;
     HRESULT made = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
@@ -113,14 +115,11 @@ bool SoftwareOnlyRenderer(LUID& chosen, char* listed, size_t size) {
             size_t used = strlen(listed);
             snprintf(listed + used, size - used, "%s%04X:%04X:%X:%08X:%08X", used ? "," : "", desc.VendorId, desc.DeviceId,
                      static_cast<unsigned>(desc.Flags), static_cast<unsigned>(desc.AdapterLuid.HighPart), desc.AdapterLuid.LowPart);
-            const bool basicRender = desc.VendorId == 0x1414 && desc.DeviceId == 0x8C;
-            if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) || basicRender) {
-                if (!software) {
-                    chosen = desc.AdapterLuid;
-                    software = true;
-                }
-            } else {
+            if (desc.VendorId != 0x1414) {
                 hardware = true;  // a GPU: Windows chooses
+            } else if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && !software) {
+                chosen = desc.AdapterLuid;
+                software = true;
             }
         }
         adapter.Reset();
