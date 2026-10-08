@@ -69,10 +69,14 @@ One request per pipe message, one answer each (UTF-8 text):
 | `add <width> <height> <refresh>` | `ok <id>` |
 | `remove <id>` | `ok` |
 | `ping` | `pong` |
+| `status` | `ok adapter=0x… monitors=… modes=… targets=… commits=… paths=… active=… swapchains=… render=… device=0x… setdevice=0x… frames=… unassigned=…` |
 
 Anything else, or a value out of range: `error <why>`. A ninth monitor at once: `error no free
 connector`. When Windows refuses a call, the error ends with its NTSTATUS, e.g. `error
-IddCxMonitorArrival failed (0xC0000001)`. `src/protocol.cpp`, tested on its own by
+IddCxMonitorArrival failed (0xC0000001)`. `status` says what Windows asked of the driver, for diagnosis: how often
+it asked for monitor and target modes, committed modes (with how many paths, how many active)
+and assigned swap chains, the render adapter of the last one, the results of making its D3D
+device and handing it over (`0x8000000A`: not yet), and the frames received. `src/protocol.cpp`, tested on its own by
 `tests/protocol_test.cpp` (any C++17 compiler).
 
 ## Build

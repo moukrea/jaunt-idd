@@ -83,6 +83,103 @@ public static class JauntIddDisplays
         return found.ToArray();
     }
 
+    // The display configuration (QueryDisplayConfig): paths from a source to a target.
+    [StructLayout(LayoutKind.Sequential)]
+    struct LUID { public uint LowPart; public int HighPart; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct PATH_SOURCE { public LUID adapterId; public uint id; public uint modeInfoIdx; public uint statusFlags; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct PATH_TARGET
+    {
+        public LUID adapterId;
+        public uint id, modeInfoIdx, outputTechnology, rotation, scaling, refreshNumerator, refreshDenominator, scanLineOrdering;
+        public int targetAvailable;
+        public uint statusFlags;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    struct PATH { public PATH_SOURCE source; public PATH_TARGET target; public uint flags; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct MODE { public uint infoType; public uint id; public LUID adapterId; public ulong a, b, c, d, e, f; }
+    [DllImport("user32.dll")]
+    static extern int GetDisplayConfigBufferSizes(uint flags, out uint numPaths, out uint numModes);
+    [DllImport("user32.dll")]
+    static extern int QueryDisplayConfig(uint flags, ref uint numPaths, [Out] PATH[] paths, ref uint numModes, [Out] MODE[] modes, IntPtr topology);
+    [DllImport("user32.dll", EntryPoint = "SetDisplayConfig")]
+    static extern int SetDisplayConfigSupplied(uint numPaths, [In] PATH[] paths, uint numModes, [In] MODE[] modes, uint flags);
+    const uint QDC_ALL_PATHS = 0x1, QDC_ONLY_ACTIVE_PATHS = 0x2, PATH_ACTIVE = 0x1, INDIRECT_WIRED = 16;
+
+    static int Query(uint flags, out PATH[] paths, out MODE[] modes)
+    {
+        uint numPaths, numModes;
+        int result = GetDisplayConfigBufferSizes(flags, out numPaths, out numModes);
+        paths = new PATH[numPaths];
+        modes = new MODE[numModes];
+        if (result != 0) return result;
+        result = QueryDisplayConfig(flags, ref numPaths, paths, ref numModes, modes, IntPtr.Zero);
+        Array.Resize(ref paths, (int)numPaths);
+        Array.Resize(ref modes, (int)numModes);
+        return result;
+    }
+
+    static string Target(PATH p)
+    {
+        return p.target.adapterId.HighPart.ToString("X") + ":" + p.target.adapterId.LowPart.ToString("X") + "/" + p.target.id;
+    }
+
+    // Each target Windows has a path to: "<adapter>/<target> tech <n> available <0|1> active <0|1>".
+    public static string[] Targets()
+    {
+        PATH[] paths;
+        MODE[] modes;
+        int result = Query(QDC_ALL_PATHS, out paths, out modes);
+        if (result != 0) return new string[] { "QueryDisplayConfig " + result };
+        Dictionary<string, string> found = new Dictionary<string, string>();
+        foreach (PATH p in paths)
+        {
+            string key = Target(p);
+            bool active = (p.flags & PATH_ACTIVE) != 0;
+            if (!found.ContainsKey(key) || active)
+            {
+                found[key] = key + " tech " + p.target.outputTechnology + " available " + p.target.targetAvailable + " active " + (active ? 1 : 0);
+            }
+        }
+        return new List<string>(found.Values).ToArray();
+    }
+
+    // The active paths plus one to the first indirect target available and inactive, from a source of
+    // its adapter that no active path uses, applied as supplied (Windows picks the modes): what it
+    // answers (0: done). Only that display is added; the others stay as they are.
+    public static string AttachIndirect()
+    {
+        PATH[] all, active;
+        MODE[] allModes, modes;
+        int result = Query(QDC_ALL_PATHS, out all, out allModes);
+        if (result != 0) return "QueryDisplayConfig(all) " + result;
+        result = Query(QDC_ONLY_ACTIVE_PATHS, out active, out modes);
+        if (result != 0) return "QueryDisplayConfig(active) " + result;
+        foreach (PATH p in all)
+        {
+            if (p.target.outputTechnology != INDIRECT_WIRED || p.target.targetAvailable == 0 || (p.flags & PATH_ACTIVE) != 0) continue;
+            bool used = false;
+            foreach (PATH a in active)
+            {
+                used = used || (a.source.adapterId.LowPart == p.source.adapterId.LowPart && a.source.adapterId.HighPart == p.source.adapterId.HighPart && a.source.id == p.source.id);
+            }
+            if (used) continue;
+            PATH added = p;
+            added.flags = PATH_ACTIVE;
+            added.source.modeInfoIdx = 0xFFFFFFFF;
+            added.target.modeInfoIdx = 0xFFFFFFFF;
+            PATH[] wanted = new PATH[active.Length + 1];
+            Array.Copy(active, wanted, active.Length);
+            wanted[active.Length] = added;
+            // SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_APPLY | SDC_ALLOW_CHANGES
+            int set = SetDisplayConfigSupplied((uint)wanted.Length, wanted, (uint)modes.Length, modes, 0x20 | 0x80 | 0x400);
+            return "target " + Target(p) + " from source " + p.source.id + ": SetDisplayConfig " + set;
+        }
+        return "no indirect target available and inactive";
+    }
+
     // The desktop extended over every display connected (SDC_TOPOLOGY_EXTEND | SDC_APPLY): what
     // Windows answers (0: done).
     public static int Extend()
@@ -169,6 +266,7 @@ function Ask($pipe, [string]$request) {
     return [Text.Encoding]::UTF8.GetString($buffer, 0, $read.Result).Trim()
 }
 
+$started = Get-Date
 $work = Join-Path ([IO.Path]::GetTempPath()) ("jaunt-idd-load-" + [guid]::NewGuid())
 $cert = $null
 $pipe = $null
@@ -223,14 +321,37 @@ try {
         $why = $null
         if ($added -match '^ok \d+$' -and -not $listed) {
             $why = [ordered]@{
+                status = Ask $pipe "status"
                 devices = @([JauntIddDisplays]::All())
+                targets = @([JauntIddDisplays]::Targets())
                 displayAdapters = @(Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | ForEach-Object { "$($_.FriendlyName) $($_.Status)" })
                 renderDevices = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object FriendlyName -match "Render" | ForEach-Object { "$($_.FriendlyName) $($_.Status)" })
-                extend = [JauntIddDisplays]::Extend()
+                # Only our display added to the active ones (what jaunt's agent could do), then, if
+                # still not listed, the desktop extended over every display.
+                attach = [JauntIddDisplays]::AttachIndirect()
             }
             $listed = WaitAlive $pipe { Shown "1170x2532" } 10
-            $why.listedAfterExtend = [bool]$listed
-            $why.devicesAfterExtend = @([JauntIddDisplays]::All())
+            $why.listedAfterAttach = [bool]$listed
+            $why.statusAfterAttach = Ask $pipe "status"
+            if (-not $listed) {
+                $why.extend = [JauntIddDisplays]::Extend()
+                $listed = WaitAlive $pipe { Shown "1170x2532" } 10
+                $why.listedAfterExtend = [bool]$listed
+            }
+            $why.targetsAfter = @([JauntIddDisplays]::Targets())
+            $why.statusAfter = Ask $pipe "status"
+            # What the logs said meanwhile: display, desktop window manager and driver framework.
+            $logs = @()
+            foreach ($log in "System", "Application") {
+                $logs += @(Get-WinEvent -FilterHashtable @{ LogName = $log; StartTime = $started } -ErrorAction SilentlyContinue |
+                    Where-Object { $_.ProviderName -match "WUDF|UMDF|DriverFrameworks|Idd|Display|Dwm|Desktop Window|Kernel-PnP|UserPnp|DeviceSetup" } |
+                    Select-Object -First 12 | ForEach-Object {
+                        $first = if ($_.Message) { ($_.Message -split "`r?`n")[0] } else { "" }
+                        if ($first.Length -gt 200) { $first = $first.Substring(0, 200) }
+                        "$log $($_.TimeCreated.ToString('HH:mm:ss')) $($_.ProviderName) $($_.Id) $($_.LevelDisplayName): $first"
+                    })
+            }
+            $why.logs = $logs
         }
         $id = if ($added -match '^ok (\d+)$') { $Matches[1] } else { "0" }
         $removed = Ask $pipe "remove $id"

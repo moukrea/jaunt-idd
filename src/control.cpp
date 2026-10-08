@@ -130,6 +130,9 @@ void ControlPipe::Serve(HANDLE pipe, uint32_t connection) {
             case Kind::Ping:
                 answer = Pong();
                 break;
+            case Kind::Status:
+                answer = m_Driver->Status();
+                break;
             default:
                 answer = Error(c.error);
         }

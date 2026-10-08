@@ -29,6 +29,15 @@ namespace jaunt_idd {
 
 class Driver;
 
+// What Windows asked of the driver, for the pipe's `status`: counts, the render adapter of the last
+// swap chain, and the last results of making its D3D device and handing it to the swap chain
+// (E_PENDING: not yet).
+struct Trace {
+    std::atomic<uint32_t> DefaultModes{0}, TargetModes{0}, Commits{0}, CommitPaths{0}, ActivePaths{0};
+    std::atomic<uint32_t> SwapChains{0}, Unassigned{0}, Frames{0}, RenderLow{0};
+    std::atomic<long> RenderHigh{0}, Device{E_PENDING}, SetDevice{E_PENDING};
+};
+
 // The D3D device on the adapter that renders a monitor's desktop.
 struct Direct3DDevice {
     explicit Direct3DDevice(LUID adapter) : AdapterLuid(adapter) {}
@@ -44,7 +53,7 @@ struct Direct3DDevice {
 // captures that display (the agent, through Windows' own capture), not here.
 class SwapChainProcessor {
 public:
-    SwapChainProcessor(IDDCX_SWAPCHAIN swapChain, std::shared_ptr<Direct3DDevice> device, HANDLE newFrameEvent);
+    SwapChainProcessor(IDDCX_SWAPCHAIN swapChain, std::shared_ptr<Direct3DDevice> device, HANDLE newFrameEvent, Trace* trace);
     ~SwapChainProcessor();
 
 private:
@@ -57,6 +66,7 @@ private:
     HANDLE m_NewFrameEvent;
     HANDLE m_Thread = nullptr;
     HANDLE m_TerminateEvent = nullptr;
+    Trace* m_Trace;
 };
 
 // One monitor: its mode, and the frames' processor while Windows renders to it.
@@ -91,6 +101,10 @@ public:
     void UnassignSwapChain(uint32_t monitorId);
 
     WDFDEVICE WdfDevice() const { return m_WdfDevice; }
+
+    // The pipe's `status` answer: "ok adapter=0x... monitors=N modes=N ..." (diagnostics).
+    std::string Status();
+    Trace trace;
 
 private:
     WDFDEVICE m_WdfDevice;
