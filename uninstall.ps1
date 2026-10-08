@@ -1,5 +1,6 @@
 # Remove jaunt's indirect display driver from this computer, as an administrator: its devices, its
-# driver package in Windows' driver store, its files in Program Files and its Settings > Apps entry.
+# driver package in Windows' driver store, its files in Program Files, its Settings > Apps entry, and
+# the certificate made on this computer to sign it (install.ps1 -SignLocally), if one was.
 #   powershell -ExecutionPolicy Bypass -File uninstall.ps1 [-Yes] [-Result <file>]
 # It says what it will remove and asks first; -Yes is for a program that has already shown that and
 # asked. Settings > Apps > "jaunt indirect display driver" runs this too. -Result: a JSON report.
@@ -10,7 +11,7 @@ param([switch]$Yes, [string]$Result = "")
 # PSModulePath and finds none of its script-defined commands (Get-FileHash, Expand-Archive).
 $env:PSModulePath = "$PSHOME\Modules;$env:PSModulePath"
 $ErrorActionPreference = "Stop"
-$report = [ordered]@{ action = "uninstall"; removed = $false; devices = @(); driverPackages = @(); error = $null }
+$report = [ordered]@{ action = "uninstall"; removed = $false; devices = @(); driverPackages = @(); certificates = @(); error = $null }
 
 function Finish([int]$code, [string]$message) {
     if ($message) { $report.error = $message; Write-Host $message }
@@ -33,7 +34,17 @@ $packages = @(Get-ChildItem (Join-Path $env:SystemRoot "INF\oem*.inf") -ErrorAct
 } | ForEach-Object { $_.Name })
 $folder = Test-Path $target
 $entry = Test-Path $appsKey
-if (-not $devices.Count -and -not $packages.Count -and -not $folder -and -not $entry) {
+# The certificate install.ps1 -SignLocally made here: the one it recorded, and any other it made on
+# this computer (self-signed, its exact name), in the trusted stores (and its key, if one is left).
+$recorded = $null
+try { $recorded = (Get-ItemProperty $appsKey -ErrorAction Stop).LocalCertificate } catch { }
+$localSubject = "CN=jaunt indirect display driver ($env:COMPUTERNAME)"
+$certificates = @(foreach ($name in "Root", "TrustedPublisher", "My") {
+    Get-ChildItem "Cert:\LocalMachine\$name" -ErrorAction SilentlyContinue |
+        Where-Object { ($recorded -and $_.Thumbprint -eq $recorded) -or ($_.Subject -eq $localSubject -and $_.Issuer -eq $localSubject) } |
+        ForEach-Object { [ordered]@{ store = $name; thumbprint = $_.Thumbprint } }
+})
+if (-not $devices.Count -and -not $packages.Count -and -not $folder -and -not $entry -and -not $certificates.Count) {
     $report.removed = $true
     Write-Host "jaunt's indirect display driver is not installed here."
     Finish 0 ""
@@ -43,7 +54,11 @@ Write-Host "jaunt's indirect display driver is about to be removed from this com
 if ($devices.Count) { Write-Host "  - its device ($($devices -join ', ')); any monitor it shows goes at once;" }
 if ($packages.Count) { Write-Host "  - its driver package in Windows' driver store ($($packages -join ', '));" }
 if ($folder) { Write-Host "  - its files in $target;" }
-if ($entry) { Write-Host "  - its entry in Settings > Apps." }
+if ($entry) { Write-Host "  - its entry in Settings > Apps;" }
+if ($certificates.Count) {
+    $stores = (@($certificates | ForEach-Object { $_.store }) | Select-Object -Unique) -join ", "
+    Write-Host "  - the certificate made on this computer to sign it, from the stores ${stores}: this computer no longer trusts it."
+}
 if (-not $Yes) {
     $answer = Read-Host "Remove it? [y/N]"
     if ($answer -notmatch '^\s*(y|yes)\s*$') { Finish 2 "Nothing was removed." }
@@ -53,6 +68,11 @@ try {
     foreach ($d in $devices) { [JauntIddSetup]::Remove($d); $report.devices += $d }
     foreach ($p in $packages) { [JauntIddSetup]::RemoveDriverPackage($p); $report.driverPackages += $p }
     if ($entry) { Remove-Item -Recurse -Force $appsKey }
+    foreach ($c in $certificates) {
+        $path = "Cert:\LocalMachine\$($c.store)\$($c.thumbprint)"
+        if ($c.store -eq "My") { Remove-Item -Path $path -DeleteKey } else { Remove-Item -Path $path }
+        $report.certificates += "$($c.store) $($c.thumbprint)"
+    }
     # This script may be the copy in that folder: PowerShell has read it already.
     if ($folder) { Remove-Item -Recurse -Force $target }
 } catch {
