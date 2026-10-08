@@ -6,11 +6,13 @@
 # a computer already in test-signing mode (this never turns that mode on), as an administrator,
 # with no jaunt-idd installed. The certificate's private key cannot be exported and never leaves
 # this run; the certificate leaves the machine's stores at the end, whatever happened.
-#   powershell -NoProfile -NonInteractive -InputFormat None -ExecutionPolicy Bypass -File tests\load_test.ps1 -Package out\x64\package
+#   powershell -NoProfile -NonInteractive -InputFormat None -ExecutionPolicy Bypass -File tests\load_test.ps1 -Package out\x64\package [-Then <script.ps1>]
+# -Then: a script run with the driver installed, before it is removed (a program that uses the
+# driver checks itself there); its exit code and output are a step.
 # Writes one JSON line: {ran: false, why} where it does not run, else each step; exits 1 when a step
 # failed (CI reports it).
 # SPDX-License-Identifier: MIT
-param([Parameter(Mandatory = $true)][string]$Package)
+param([Parameter(Mandatory = $true)][string]$Package, [string]$Then = "")
 $env:PSModulePath = "$PSHOME\Modules;$env:PSModulePath"
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
@@ -416,6 +418,21 @@ try {
         $pipe = $null
         $gone = [bool](WaitFor { -not (Shown "640x480").Count } 15)
         Step "that connection closed: its eight monitors removed" $gone ([ordered]@{ displays = @([JauntIddDisplays]::Attached()) })
+    }
+
+    # ---- what the caller checks with the driver installed -------------------------------------
+    if ($Then -and $pipeThere) {
+        $thenOut = Join-Path $work "then.out"
+        $thenIn = Join-Path $work "then.in"
+        New-Item -ItemType File -Force $thenIn | Out-Null
+        $quoted = (@("-NoProfile", "-NonInteractive", "-InputFormat", "None", "-ExecutionPolicy", "Bypass", "-File", $Then) |
+            ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join " "
+        $process = Start-Process -FilePath "powershell.exe" -ArgumentList $quoted -PassThru -NoNewWindow `
+            -RedirectStandardOutput $thenOut -RedirectStandardError "$thenOut.err" -RedirectStandardInput $thenIn
+        $null = $process.Handle
+        $code = if ($process.WaitForExit(600000)) { $process.ExitCode } else { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue; -1 }
+        $tail = { param($path) $text = [string](Get-Content -Raw $path -ErrorAction SilentlyContinue); if ($text.Length -gt 2000) { $text.Substring($text.Length - 2000) } else { $text } }
+        Step "then: $(Split-Path -Leaf $Then)" ($code -eq 0) ([ordered]@{ exitCode = $code; output = (& $tail $thenOut); errors = (& $tail "$thenOut.err") })
     }
 
     # ---- removed ----------------------------------------------------------------------------------
