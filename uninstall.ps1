@@ -57,7 +57,7 @@ if ($folder) { Write-Host "  - its files in $target;" }
 if ($entry) { Write-Host "  - its entry in Settings > Apps;" }
 if ($certificates.Count) {
     $stores = (@($certificates | ForEach-Object { $_.store }) | Select-Object -Unique) -join ", "
-    Write-Host "  - the certificate made on this computer to sign it, from the stores $stores: this computer no longer trusts it."
+    Write-Host "  - the certificate made on this computer to sign it, from the stores ${stores}: this computer no longer trusts it."
 }
 if (-not $Yes) {
     $answer = Read-Host "Remove it? [y/N]"
