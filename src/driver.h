@@ -40,6 +40,9 @@ struct Trace {
     std::atomic<uint32_t> PreferredLow{0};
     std::atomic<long> PreferredHigh{0};
     std::atomic<bool> Preferred{false};
+    // What DXGI listed to the driver: "<vendor>:<device>:<flags>:<luid>,..." (written once, before
+    // the pipe opens; "-": DXGI could not be asked).
+    char Adapters[400] = "-";
 };
 
 // The D3D device on the adapter that renders a monitor's desktop.

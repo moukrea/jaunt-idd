@@ -260,7 +260,7 @@ function Ask($pipe, [string]$request) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($request)
     $pipe.Write($bytes, 0, $bytes.Length)
     $pipe.Flush()
-    $buffer = New-Object byte[] 512
+    $buffer = New-Object byte[] 4096  # `status` answers more than a request may be
     $read = $pipe.ReadAsync($buffer, 0, $buffer.Length)
     if (-not $read.Wait(10000)) { throw "no answer to '$request' in 10 s" }
     return [Text.Encoding]::UTF8.GetString($buffer, 0, $read.Result).Trim()

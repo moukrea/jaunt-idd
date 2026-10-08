@@ -69,7 +69,7 @@ One request per pipe message, one answer each (UTF-8 text):
 | `add <width> <height> <refresh>` | `ok <id>` |
 | `remove <id>` | `ok` |
 | `ping` | `pong` |
-| `status` | `ok adapter=0x… monitors=… modes=… targets=… commits=… paths=… active=… swapchains=… render=… device=0x… setdevice=0x… frames=… unassigned=… preferred=…` |
+| `status` | `ok adapter=0x… monitors=… modes=… targets=… commits=… paths=… active=… swapchains=… render=… device=0x… setdevice=0x… frames=… unassigned=… preferred=… dxgi=…` |
 
 Anything else, or a value out of range: `error <why>`. A ninth monitor at once: `error no free
 connector`. When Windows refuses a call, the error ends with its NTSTATUS, e.g. `error
@@ -78,7 +78,8 @@ it asked for monitor and target modes, committed modes (with how many paths, how
 and assigned swap chains, the render adapter of the last one, the results of making its D3D
 device and handing it over (`0x8000000A`: not yet), the frames received, and the render adapter
 the driver named (`none`: Windows chooses; on a computer without a GPU, whose render adapters are
-all software ones, the driver names the first of them, as IddCx lets a driver do). `src/protocol.cpp`, tested on its own by
+all software ones, the driver names the first of them, as IddCx lets a driver do), and the render
+adapters DXGI listed to the driver (`vendor:device:flags:LUID`). `src/protocol.cpp`, tested on its own by
 `tests/protocol_test.cpp` (any C++17 compiler).
 
 ## Build

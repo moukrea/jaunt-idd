@@ -5,6 +5,7 @@
 #include "protocol.h"
 
 #include <cstdio>
+#include <cstring>
 #include <cwchar>
 #include <string>
 
@@ -92,31 +93,42 @@ std::wstring WithStatus(const wchar_t* what, NTSTATUS status) {
 }
 
 // The render adapter to name for this adapter's displays: on a computer whose render adapters are
-// all software ones (a virtual machine's Microsoft Basic Render Driver), the first of them, since
-// Windows may otherwise find no renderer for an indirect display there. With any hardware adapter,
-// none: Windows chooses (IddCx.h: "the driver can use Dxgi enumeration to find the required render
-// adapter LUID").
-bool SoftwareOnlyRenderer(LUID& chosen) {
+// all software ones (a virtual machine's Microsoft Basic Render Driver, vendor 0x1414 device 0x8C),
+// the first of them, since Windows may otherwise find no renderer for an indirect display there.
+// With any hardware adapter, none: Windows chooses (IddCx.h: "the driver can use Dxgi enumeration to
+// find the required render adapter LUID"). What DXGI listed goes into `listed` for `status`.
+bool SoftwareOnlyRenderer(LUID& chosen, char* listed, size_t size) {
     ComPtr<IDXGIFactory1> factory;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+    HRESULT made = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+    if (FAILED(made)) {
+        snprintf(listed, size, "factory 0x%08X", static_cast<unsigned>(made));
         return false;
     }
-    bool software = false;
+    listed[0] = '\0';
+    bool software = false, hardware = false;
     ComPtr<IDXGIAdapter1> adapter;
     for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
         DXGI_ADAPTER_DESC1 desc = {};
         if (SUCCEEDED(adapter->GetDesc1(&desc))) {
-            if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
-                return false;  // a GPU: Windows chooses
-            }
-            if (!software) {
-                chosen = desc.AdapterLuid;
-                software = true;
+            size_t used = strlen(listed);
+            snprintf(listed + used, size - used, "%s%04X:%04X:%X:%08X:%08X", used ? "," : "", desc.VendorId, desc.DeviceId,
+                     static_cast<unsigned>(desc.Flags), static_cast<unsigned>(desc.AdapterLuid.HighPart), desc.AdapterLuid.LowPart);
+            const bool basicRender = desc.VendorId == 0x1414 && desc.DeviceId == 0x8C;
+            if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) || basicRender) {
+                if (!software) {
+                    chosen = desc.AdapterLuid;
+                    software = true;
+                }
+            } else {
+                hardware = true;  // a GPU: Windows chooses
             }
         }
         adapter.Reset();
     }
-    return software;
+    if (!listed[0]) {
+        snprintf(listed, size, "none");
+    }
+    return software && !hardware;
 }
 
 Driver* DriverOf(IDDCX_MONITOR monitor, uint32_t& id) {
@@ -381,7 +393,7 @@ void Driver::InitAdapter() {
 void Driver::FinishInit() {
     // Before any monitor, as IddCx.h recommends.
     LUID renderer = {};
-    if (m_Adapter != nullptr && SoftwareOnlyRenderer(renderer)) {
+    if (m_Adapter != nullptr && SoftwareOnlyRenderer(renderer, trace.Adapters, sizeof(trace.Adapters))) {
         IDARG_IN_ADAPTERSETRENDERADAPTER preferred = {};
         preferred.PreferredRenderAdapter = renderer;
         IddCxAdapterSetRenderAdapter(m_Adapter, &preferred);
@@ -569,13 +581,13 @@ std::string Driver::Status() {
     if (trace.Preferred) {
         snprintf(preferred, sizeof(preferred), "%08X:%08X", static_cast<unsigned>(trace.PreferredHigh.load()), trace.PreferredLow.load());
     }
-    char text[600];
+    char text[1100];
     snprintf(text, sizeof(text),
              "ok adapter=0x%08X monitors=%u modes=%u targets=%u commits=%u paths=%u active=%u swapchains=%u render=%08X:%08X device=0x%08X "
-             "setdevice=0x%08X frames=%u unassigned=%u preferred=%s\n",
+             "setdevice=0x%08X frames=%u unassigned=%u preferred=%s dxgi=%s\n",
              static_cast<unsigned>(m_AdapterStatus), static_cast<unsigned>(monitors), trace.DefaultModes.load(), trace.TargetModes.load(),
              trace.Commits.load(), trace.CommitPaths.load(), trace.ActivePaths.load(), trace.SwapChains.load(),
              static_cast<unsigned>(trace.RenderHigh.load()), trace.RenderLow.load(), static_cast<unsigned>(trace.Device.load()),
-             static_cast<unsigned>(trace.SetDevice.load()), trace.Frames.load(), trace.Unassigned.load(), preferred);
+             static_cast<unsigned>(trace.SetDevice.load()), trace.Frames.load(), trace.Unassigned.load(), preferred, trace.Adapters);
     return text;
 }
