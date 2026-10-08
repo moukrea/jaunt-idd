@@ -32,6 +32,8 @@ int main() {
     Check(c.kind == Kind::Remove && c.id == 3, "remove by id");
     Check(Parse("remove 0").kind == Kind::Invalid, "id 0 refused");
     Check(Parse("ping").kind == Kind::Ping, "ping");
+    Check(Parse("status\n").kind == Kind::Status, "status");
+    Check(Parse("status now").kind == Kind::Invalid, "status takes nothing");
     Check(Parse("").kind == Kind::Invalid, "empty");
     Check(Parse("add 1920\x01 1080 60").kind == Kind::Invalid, "a control character refused");
     Check(Parse(std::string(300, 'a')).kind == Kind::Invalid, "too long refused");

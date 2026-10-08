@@ -5,6 +5,7 @@
 //   add <width> <height> <refresh>   ->  ok <id>        a monitor of that mode (pixels, Hz)
 //   remove <id>                      ->  ok             that monitor gone
 //   ping                             ->  pong           the watchdog fed
+//   status                           ->  ok <name>=<value> ...   what Windows asked of the driver
 // else "error <why>". Widths and heights are 320 to 8192, refresh rates 24 to 240. A connection's
 // monitors go when it closes or sends nothing for WATCHDOG_MS (its process stopped or hung).
 //
@@ -25,7 +26,7 @@ constexpr uint32_t WATCHDOG_MS = 5000;
 constexpr uint32_t MAX_MONITORS = 8;
 constexpr size_t MAX_MESSAGE = 256;
 
-enum class Kind { Add, Remove, Ping, Invalid };
+enum class Kind { Add, Remove, Ping, Status, Invalid };
 
 struct Command {
     Kind kind = Kind::Invalid;

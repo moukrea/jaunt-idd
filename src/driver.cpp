@@ -4,6 +4,8 @@
 #include "driver.h"
 #include "protocol.h"
 
+#include <cstdio>
+#include <cstring>
 #include <cwchar>
 #include <string>
 
@@ -90,6 +92,32 @@ std::wstring WithStatus(const wchar_t* what, NTSTATUS status) {
     return text;
 }
 
+// The render adapters DXGI lists to the driver, for `status`: "<vendor>:<device>:<flags>:<luid>,...".
+// (On GitHub's runner, a virtual machine without a GPU: the software Basic Render Driver, flags 2,
+// and the display-only and indirect adapters it renders for, this one included, with its ids.)
+void ListRenderAdapters(char* listed, size_t size) {
+    ComPtr<IDXGIFactory1> factory;
+    HRESULT made = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+    if (FAILED(made)) {
+        snprintf(listed, size, "factory 0x%08X", static_cast<unsigned>(made));
+        return;
+    }
+    listed[0] = '\0';
+    ComPtr<IDXGIAdapter1> adapter;
+    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+        DXGI_ADAPTER_DESC1 desc = {};
+        if (SUCCEEDED(adapter->GetDesc1(&desc))) {
+            size_t used = strlen(listed);
+            snprintf(listed + used, size - used, "%s%04X:%04X:%X:%08X:%08X", used ? "," : "", desc.VendorId, desc.DeviceId,
+                     static_cast<unsigned>(desc.Flags), static_cast<unsigned>(desc.AdapterLuid.HighPart), desc.AdapterLuid.LowPart);
+        }
+        adapter.Reset();
+    }
+    if (!listed[0]) {
+        snprintf(listed, size, "none");
+    }
+}
+
 Driver* DriverOf(IDDCX_MONITOR monitor, uint32_t& id) {
     auto* context = WdfObjectGet_JauntMonitorContext(monitor);
     id = context->MonitorId;
@@ -160,7 +188,20 @@ NTSTATUS JauntAdapterInitFinished(IDDCX_ADAPTER adapter, const IDARG_IN_ADAPTER_
     return STATUS_SUCCESS;
 }
 
-NTSTATUS JauntAdapterCommitModes(IDDCX_ADAPTER, const IDARG_IN_COMMITMODES*) {
+NTSTATUS JauntAdapterCommitModes(IDDCX_ADAPTER adapter, const IDARG_IN_COMMITMODES* in) {
+    // Nothing to set up for a mode here; counted for `status`.
+    Driver* driver = WdfObjectGet_JauntDeviceContext(adapter)->pDriver;
+    if (driver) {
+        uint32_t active = 0;
+        for (UINT i = 0; i < in->PathCount; ++i) {
+            if (in->pPaths[i].Flags & IDDCX_PATH_FLAGS_ACTIVE) {
+                ++active;
+            }
+        }
+        driver->trace.Commits++;
+        driver->trace.CommitPaths = in->PathCount;
+        driver->trace.ActivePaths = active;
+    }
     return STATUS_SUCCESS;
 }
 
@@ -174,6 +215,7 @@ NTSTATUS JauntParseMonitorDescription(const IDARG_IN_PARSEMONITORDESCRIPTION*, I
 NTSTATUS JauntMonitorGetDefaultModes(IDDCX_MONITOR monitor, const IDARG_IN_GETDEFAULTDESCRIPTIONMODES* in, IDARG_OUT_GETDEFAULTDESCRIPTIONMODES* out) {
     uint32_t id = 0, width = 0, height = 0, refresh = 0;
     Driver* driver = DriverOf(monitor, id);
+    driver->trace.DefaultModes++;
     if (!driver->ModeOf(id, width, height, refresh)) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -189,6 +231,7 @@ NTSTATUS JauntMonitorGetDefaultModes(IDDCX_MONITOR monitor, const IDARG_IN_GETDE
 NTSTATUS JauntMonitorQueryModes(IDDCX_MONITOR monitor, const IDARG_IN_QUERYTARGETMODES* in, IDARG_OUT_QUERYTARGETMODES* out) {
     uint32_t id = 0, width = 0, height = 0, refresh = 0;
     Driver* driver = DriverOf(monitor, id);
+    driver->trace.TargetModes++;
     if (!driver->ModeOf(id, width, height, refresh)) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -226,8 +269,8 @@ HRESULT Direct3DDevice::Init() {
                              &DeviceContext);
 }
 
-SwapChainProcessor::SwapChainProcessor(IDDCX_SWAPCHAIN swapChain, std::shared_ptr<Direct3DDevice> device, HANDLE newFrameEvent)
-    : m_SwapChain(swapChain), m_Device(std::move(device)), m_NewFrameEvent(newFrameEvent) {
+SwapChainProcessor::SwapChainProcessor(IDDCX_SWAPCHAIN swapChain, std::shared_ptr<Direct3DDevice> device, HANDLE newFrameEvent, Trace* trace)
+    : m_SwapChain(swapChain), m_Device(std::move(device)), m_NewFrameEvent(newFrameEvent), m_Trace(trace) {
     m_TerminateEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     m_Thread = CreateThread(nullptr, 0, RunThread, this, 0, nullptr);
 }
@@ -266,7 +309,9 @@ void SwapChainProcessor::RunCore() {
     }
     IDARG_IN_SWAPCHAINSETDEVICE setDevice = {};
     setDevice.pDevice = dxgiDevice.Get();
-    if (FAILED(IddCxSwapChainSetDevice(m_SwapChain, &setDevice))) {
+    HRESULT set = IddCxSwapChainSetDevice(m_SwapChain, &setDevice);
+    m_Trace->SetDevice = set;
+    if (FAILED(set)) {
         return;
     }
     for (;;) {
@@ -285,6 +330,7 @@ void SwapChainProcessor::RunCore() {
         }
         // Nothing to do with the picture here: the desktop is read where it is shown.
         buffer.MetaData.pSurface->Release();
+        m_Trace->Frames++;
         if (FAILED(IddCxSwapChainFinishedProcessingFrame(m_SwapChain))) {
             break;
         }
@@ -332,6 +378,7 @@ void Driver::InitAdapter() {
 }
 
 void Driver::FinishInit() {
+    ListRenderAdapters(trace.Adapters, sizeof(trace.Adapters));  // for `status`, before the pipe opens
     // No monitor until the agent asks for one: the control pipe, open to SYSTEM and the account
     // the installer named.
     m_Pipe = std::make_unique<ControlPipe>(this, AllowedSid(m_WdfDevice));
@@ -370,7 +417,8 @@ uint32_t Driver::AddMonitor(uint32_t width, uint32_t height, uint32_t refresh, u
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, JauntMonitorContext);
     IDDCX_MONITOR_INFO info = {};
     info.Size = sizeof(info);
-    info.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED;
+    // The connector type Windows shows: HDMI, as Microsoft's IddSampleDriver and the Virtual Display Driver say.
+    info.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
     info.ConnectorIndex = connector;  // 0 to MaxMonitorsSupported - 1 (IddCx.h)
     info.MonitorDescription.Size = sizeof(info.MonitorDescription);
     info.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
@@ -475,23 +523,46 @@ void Driver::AssignSwapChain(uint32_t monitorId, IDDCX_SWAPCHAIN swapChain, LUID
             continue;
         }
         m->Processor.reset();
+        trace.SwapChains++;
+        trace.RenderLow = renderAdapter.LowPart;
+        trace.RenderHigh = renderAdapter.HighPart;
         auto device = std::make_shared<Direct3DDevice>(renderAdapter);
-        if (FAILED(device->Init())) {
+        HRESULT made = device->Init();
+        trace.Device = made;
+        if (FAILED(made)) {
             // The system tries another adapter once this swap chain is gone.
             WdfObjectDelete(reinterpret_cast<WDFOBJECT>(swapChain));
             return;
         }
-        m->Processor = std::make_unique<SwapChainProcessor>(swapChain, device, newFrameEvent);
+        m->Processor = std::make_unique<SwapChainProcessor>(swapChain, device, newFrameEvent, &trace);
         return;
     }
     WdfObjectDelete(reinterpret_cast<WDFOBJECT>(swapChain));
 }
 
 void Driver::UnassignSwapChain(uint32_t monitorId) {
+    trace.Unassigned++;
     std::lock_guard<std::mutex> lock(m_Lock);
     for (auto& m : m_Monitors) {
         if (m->Id == monitorId) {
             m->Processor.reset();
         }
     }
+}
+
+std::string Driver::Status() {
+    size_t monitors = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_Lock);
+        monitors = m_Monitors.size();
+    }
+    char text[1100];
+    snprintf(text, sizeof(text),
+             "ok adapter=0x%08X monitors=%u modes=%u targets=%u commits=%u paths=%u active=%u swapchains=%u render=%08X:%08X device=0x%08X "
+             "setdevice=0x%08X frames=%u unassigned=%u dxgi=%s\n",
+             static_cast<unsigned>(m_AdapterStatus), static_cast<unsigned>(monitors), trace.DefaultModes.load(), trace.TargetModes.load(),
+             trace.Commits.load(), trace.CommitPaths.load(), trace.ActivePaths.load(), trace.SwapChains.load(),
+             static_cast<unsigned>(trace.RenderHigh.load()), trace.RenderLow.load(), static_cast<unsigned>(trace.Device.load()),
+             static_cast<unsigned>(trace.SetDevice.load()), trace.Frames.load(), trace.Unassigned.load(), trace.Adapters);
+    return text;
 }

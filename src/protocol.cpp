@@ -60,6 +60,10 @@ Command Parse(const std::string& message) {
         c.kind = Kind::Ping;
         return c;
     }
+    if (words[0] == "status" && words.size() == 1) {
+        c.kind = Kind::Status;
+        return c;
+    }
     if (words[0] == "remove" && words.size() == 2) {
         if (!Number(words[1], c.id) || c.id == 0) {
             return Invalid("a monitor id");
