@@ -438,7 +438,8 @@ uint32_t Driver::AddMonitor(uint32_t width, uint32_t height, uint32_t refresh, u
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, JauntMonitorContext);
     IDDCX_MONITOR_INFO info = {};
     info.Size = sizeof(info);
-    info.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED;
+    // The connector type Windows shows: HDMI, as Microsoft's IddSampleDriver and the Virtual Display Driver say.
+    info.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
     info.ConnectorIndex = connector;  // 0 to MaxMonitorsSupported - 1 (IddCx.h)
     info.MonitorDescription.Size = sizeof(info.MonitorDescription);
     info.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;

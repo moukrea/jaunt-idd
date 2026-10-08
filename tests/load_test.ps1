@@ -106,7 +106,7 @@ public static class JauntIddDisplays
     static extern int QueryDisplayConfig(uint flags, ref uint numPaths, [Out] PATH[] paths, ref uint numModes, [Out] MODE[] modes, IntPtr topology);
     [DllImport("user32.dll", EntryPoint = "SetDisplayConfig")]
     static extern int SetDisplayConfigSupplied(uint numPaths, [In] PATH[] paths, uint numModes, [In] MODE[] modes, uint flags);
-    const uint QDC_ALL_PATHS = 0x1, QDC_ONLY_ACTIVE_PATHS = 0x2, PATH_ACTIVE = 0x1, INDIRECT_WIRED = 16;
+    const uint QDC_ALL_PATHS = 0x1, QDC_ONLY_ACTIVE_PATHS = 0x2, PATH_ACTIVE = 0x1;
 
     static int Query(uint flags, out PATH[] paths, out MODE[] modes)
     {
@@ -146,8 +146,8 @@ public static class JauntIddDisplays
         return new List<string>(found.Values).ToArray();
     }
 
-    // The active paths plus one to the first indirect target available and inactive, from a source of
-    // its adapter that no active path uses, applied as supplied (Windows picks the modes): what it
+    // The active paths plus one to the first target available on an adapter no active path uses (the
+    // driver's), from a source of that adapter, applied as supplied (Windows picks the modes): what it
     // answers (0: done). Only that display is added; the others stay as they are.
     public static string AttachIndirect()
     {
@@ -159,7 +159,13 @@ public static class JauntIddDisplays
         if (result != 0) return "QueryDisplayConfig(active) " + result;
         foreach (PATH p in all)
         {
-            if (p.target.outputTechnology != INDIRECT_WIRED || p.target.targetAvailable == 0 || (p.flags & PATH_ACTIVE) != 0) continue;
+            if (p.target.targetAvailable == 0 || (p.flags & PATH_ACTIVE) != 0) continue;
+            bool shown = false;
+            foreach (PATH a in active)
+            {
+                shown = shown || (a.target.adapterId.LowPart == p.target.adapterId.LowPart && a.target.adapterId.HighPart == p.target.adapterId.HighPart);
+            }
+            if (shown) continue;
             bool used = false;
             foreach (PATH a in active)
             {
@@ -177,7 +183,7 @@ public static class JauntIddDisplays
             int set = SetDisplayConfigSupplied((uint)wanted.Length, wanted, (uint)modes.Length, modes, 0x20 | 0x80 | 0x400);
             return "target " + Target(p) + " from source " + p.source.id + ": SetDisplayConfig " + set;
         }
-        return "no indirect target available and inactive";
+        return "no target available on another adapter";
     }
 
     // The desktop extended over every display connected (SDC_TOPOLOGY_EXTEND | SDC_APPLY): what
