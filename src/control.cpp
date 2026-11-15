@@ -80,10 +80,13 @@ void LogHostToken(Driver* driver) {
 
 ControlPipe::ControlPipe(Driver* driver, const std::wstring& allowedSid) : m_Driver(driver) {
     // Protected (no inherited entries): SYSTEM, and that account when one is named. The pipe's owner
-    // (the account the driver's host runs as, LocalService) gets FILE_CREATE_PIPE_INSTANCE (0x4)
-    // alone, through OWNER RIGHTS: Windows checks it on every instance after the first, and without
-    // it the next instance could not be made while a connection holds one.
-    m_Sddl = L"D:P(A;;GA;;;SY)(A;;0x4;;;OW)";
+    // (the account the driver's host runs as: LocalService, S-1-5-19, logged by the driver) gets
+    // read and write through OWNER RIGHTS: every instance after the first opens the pipe with its
+    // open mode's access (duplex: read and write, which includes FILE_CREATE_PIPE_INSTANCE), and
+    // without it the next instance is refused (error 5; CI run 43701497363, with 0x4 alone). Other
+    // services running as LocalService match this entry too: system components, not the programs
+    // of the person signed in, which this pipe keeps out.
+    m_Sddl = L"D:P(A;;GA;;;SY)(A;;GRGW;;;OW)";
     if (!allowedSid.empty()) {
         m_Sddl += L"(A;;GRGW;;;" + allowedSid + L")";
     }
