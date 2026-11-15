@@ -19,7 +19,10 @@ Driver (NOTICE.md).
   per connector of the adapter; a monitor that goes frees its connector.
 - **Who may ask:** the pipe's security descriptor lets SYSTEM and one account open it, the one named
   at installation (`AllowedUser`, a SID, in the device's hardware key). No one else: not Everyone,
-  not Administrators, not remote clients (`PIPE_REJECT_REMOTE_CLIENTS`). Without that value, SYSTEM
+  not Administrators, not remote clients (`PIPE_REJECT_REMOTE_CLIENTS`). Its first instance is made
+  with `FILE_FLAG_FIRST_PIPE_INSTANCE`, so the driver never joins a pipe of that name another
+  program made first, and it always holds an instance (the next one is made before a connected one
+  is handed over), so the name is never free for another program between two connections. Without that value, SYSTEM
   only.
 - **A monitor never outlives the program that asked for it:** each connection's monitors are removed
   when it closes, when its process ends, or when it sends nothing for 5 seconds (the watchdog; jaunt

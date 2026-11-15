@@ -59,17 +59,33 @@ ControlPipe::~ControlPipe() {
 void ControlPipe::Listen() {
     PSECURITY_DESCRIPTOR descriptor = nullptr;
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(m_Sddl.c_str(), SDDL_REVISION_1, &descriptor, nullptr)) {
+        m_Driver->trace.events.Add("pipe: its security descriptor was refused (error %lu): no pipe", GetLastError());
         return;  // no pipe rather than one open to anyone
     }
     SECURITY_ATTRIBUTES security = {sizeof(security), descriptor, FALSE};
-    while (!m_Stop) {
-        HANDLE pipe = CreateNamedPipeW(PIPE_NAME, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-                                       PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, PIPE_UNLIMITED_INSTANCES,
-                                       static_cast<DWORD>(MAX_MESSAGE), static_cast<DWORD>(MAX_MESSAGE), 0, &security);
-        if (pipe == INVALID_HANDLE_VALUE) {
-            Sleep(1000);
-            continue;
+    // The first instance is made with FILE_FLAG_FIRST_PIPE_INSTANCE: if another program already made a pipe of this name (to
+    // receive the agent's commands, or answer them), creation fails instead of joining its pipe. From then on this listener
+    // always holds an instance (the next one is made before the connected one is handed over), so the name never becomes free
+    // for anyone else between two connections, and the later instances need not, and cannot, use the flag.
+    auto create = [&](bool first) {
+        return CreateNamedPipeW(PIPE_NAME, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | (first ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0),
+                                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, PIPE_UNLIMITED_INSTANCES,
+                                static_cast<DWORD>(MAX_MESSAGE), static_cast<DWORD>(MAX_MESSAGE), 0, &security);
+    };
+    HANDLE pipe = INVALID_HANDLE_VALUE;
+    bool told = false;
+    while (!m_Stop && (pipe = create(true)) == INVALID_HANDLE_VALUE) {
+        if (!told) {
+            told = true;
+            m_Driver->trace.events.Add("pipe: the first instance cannot be made (error %lu): the name is taken, or creation failed; trying every second",
+                                       GetLastError());
         }
+        Sleep(1000);  // the name is taken (or creation failed): never join another program's pipe
+    }
+    if (pipe != INVALID_HANDLE_VALUE) {
+        m_Driver->trace.events.Add("pipe: listening (first instance)");
+    }
+    while (!m_Stop) {
         OVERLAPPED connect = {};
         connect.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         BOOL connected = ConnectNamedPipe(pipe, &connect);
@@ -81,13 +97,27 @@ void ControlPipe::Listen() {
             connected = TRUE;
         }
         CloseHandle(connect.hEvent);
-        if (!connected || m_Stop) {
-            CloseHandle(pipe);
+        if (m_Stop) {
+            break;
+        }
+        if (!connected) {
+            DisconnectNamedPipe(pipe);  // the same instance waits again: the name stays ours
             continue;
         }
+        // The next instance first, while the connected one still holds the name.
+        HANDLE next = INVALID_HANDLE_VALUE;
+        while (!m_Stop && (next = create(false)) == INVALID_HANDLE_VALUE) {
+            Sleep(1000);
+        }
         uint32_t connection = m_NextConnection++;
-        std::lock_guard<std::mutex> lock(m_Lock);
-        m_Connections.emplace_back([this, pipe, connection] { Serve(pipe, connection); });
+        {
+            std::lock_guard<std::mutex> lock(m_Lock);
+            m_Connections.emplace_back([this, pipe, connection] { Serve(pipe, connection); });
+        }
+        pipe = next;
+    }
+    if (pipe != INVALID_HANDLE_VALUE) {
+        CloseHandle(pipe);
     }
     LocalFree(descriptor);
 }
