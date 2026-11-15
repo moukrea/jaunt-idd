@@ -28,9 +28,15 @@ if ($vs) {
     $test = Join-Path $Out "protocol_test.exe"
     $cmd = "`"$devcmd`" -arch=x64 -no_logo && cl /nologo /std:c++17 /EHsc /W4 /I`"$PSScriptRoot\src`" `"$PSScriptRoot\tests\protocol_test.cpp`" `"$PSScriptRoot\src\protocol.cpp`" /Fe`"$test`" /Fo`"$Out\\`""
     cmd /c $cmd | Out-File -Encoding utf8 "$Out\protocol-build.log"
-    if (Test-Path $test) {
+    # The monitors' EDID and the bounded log, on their own too.
+    $edidTest = Join-Path $Out "edid_test.exe"
+    $cmd = "`"$devcmd`" -arch=x64 -no_logo && cl /nologo /std:c++17 /EHsc /W4 /I`"$PSScriptRoot\src`" `"$PSScriptRoot\tests\edid_test.cpp`" `"$PSScriptRoot\src\edid.cpp`" `"$PSScriptRoot\src\log.cpp`" `"$PSScriptRoot\src\protocol.cpp`" /Fe`"$edidTest`" /Fo`"$Out\\`""
+    cmd /c $cmd | Out-File -Append -Encoding utf8 "$Out\protocol-build.log"
+    if ((Test-Path $test) -and (Test-Path $edidTest)) {
         & $test | Out-File -Encoding utf8 "$Out\protocol-test.log"
-        $result.protocolTests = if ($LASTEXITCODE -eq 0) { "passed" } else { "failed" }
+        $protocolCode = $LASTEXITCODE
+        & $edidTest | Out-File -Append -Encoding utf8 "$Out\protocol-test.log"
+        $result.protocolTests = if ($protocolCode -eq 0 -and $LASTEXITCODE -eq 0) { "passed" } else { "failed" }
     } else { $result.protocolTests = "not built (see protocol-build.log)" }
 }
 

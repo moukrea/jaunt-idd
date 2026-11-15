@@ -93,6 +93,8 @@ void ControlPipe::Listen() {
 }
 
 void ControlPipe::Serve(HANDLE pipe, uint32_t connection) {
+    m_Driver->trace.events.Add("pipe: connection %u opened", static_cast<unsigned>(connection));
+    const char* ended = "closed or unreadable";
     char buffer[MAX_MESSAGE + 1];
     OVERLAPPED read = {};
     read.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -105,6 +107,7 @@ void ControlPipe::Serve(HANDLE pipe, uint32_t connection) {
             DWORD wait = WaitForSingleObject(read.hEvent, WATCHDOG_MS);
             if (wait != WAIT_OBJECT_0) {
                 CancelIo(pipe);
+                ended = "silent for the watchdog's delay";
                 break;
             }
             done = GetOverlappedResult(pipe, &read, &got, FALSE);
@@ -120,11 +123,14 @@ void ControlPipe::Serve(HANDLE pipe, uint32_t connection) {
                 std::wstring error;
                 uint32_t id = m_Driver->AddMonitor(c.width, c.height, c.refresh, connection, error);
                 answer = id ? Ok(id) : Error(Narrow(error));
+                m_Driver->trace.events.Add("pipe: connection %u add -> %s", static_cast<unsigned>(connection), answer.substr(0, answer.size() - 1).c_str());
                 break;
             }
             case Kind::Remove: {
                 std::wstring error;
                 answer = m_Driver->RemoveMonitor(c.id, connection, error) ? Ok() : Error(Narrow(error));
+                m_Driver->trace.events.Add("pipe: connection %u remove %u -> %s", static_cast<unsigned>(connection), static_cast<unsigned>(c.id),
+                                           answer.substr(0, answer.size() - 1).c_str());
                 break;
             }
             case Kind::Ping:
@@ -132,6 +138,9 @@ void ControlPipe::Serve(HANDLE pipe, uint32_t connection) {
                 break;
             case Kind::Status:
                 answer = m_Driver->Status();
+                break;
+            case Kind::Log:
+                answer = m_Driver->trace.events.Read(c.from, MAX_LOG_ANSWER);
                 break;
             default:
                 answer = Error(c.error);
@@ -145,6 +154,7 @@ void ControlPipe::Serve(HANDLE pipe, uint32_t connection) {
         CloseHandle(write.hEvent);
     }
     CloseHandle(read.hEvent);
+    m_Driver->trace.events.Add("pipe: connection %u ended (%s)", static_cast<unsigned>(connection), ended);
     // Whatever this connection made goes with it.
     m_Driver->RemoveConnection(connection);
     DisconnectNamedPipe(pipe);

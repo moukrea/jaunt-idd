@@ -6,6 +6,9 @@
 //   remove <id>                      ->  ok             that monitor gone
 //   ping                             ->  pong           the watchdog fed
 //   status                           ->  ok <name>=<value> ...   what Windows asked of the driver
+//   log [<from>]                     ->  ok next=<n> first=<n>, then lines   the driver's bounded log
+//                                        of every callback and Windows call (log.h), from line <from>
+//                                        (default 0: the oldest kept); ask again from next=
 // else "error <why>". Widths and heights are 320 to 8192, refresh rates 24 to 240. A connection's
 // monitors go when it closes or sends nothing for WATCHDOG_MS (its process stopped or hung).
 //
@@ -26,7 +29,10 @@ constexpr uint32_t WATCHDOG_MS = 5000;
 constexpr uint32_t MAX_MONITORS = 8;
 constexpr size_t MAX_MESSAGE = 256;
 
-enum class Kind { Add, Remove, Ping, Status, Invalid };
+// The most a `log` answer holds, in bytes (a client reads it in one buffer of 4096).
+constexpr size_t MAX_LOG_ANSWER = 3800;
+
+enum class Kind { Add, Remove, Ping, Status, Log, Invalid };
 
 struct Command {
     Kind kind = Kind::Invalid;
@@ -34,6 +40,7 @@ struct Command {
     uint32_t height = 0;
     uint32_t refresh = 0;
     uint32_t id = 0;
+    uint32_t from = 0;  // Log: the first line wanted
     std::string error;
 };
 

@@ -64,6 +64,24 @@ Command Parse(const std::string& message) {
         c.kind = Kind::Status;
         return c;
     }
+    if (words[0] == "log" && words.size() <= 2) {
+        // A line number: up to 9 digits (the driver's counter runs on while it stays loaded).
+        if (words.size() == 2) {
+            if (words[1].size() > 9) {
+                return Invalid("log [<from>]");
+            }
+            uint32_t value = 0;
+            for (char ch : words[1]) {
+                if (ch < '0' || ch > '9') {
+                    return Invalid("log [<from>]");
+                }
+                value = value * 10 + static_cast<uint32_t>(ch - '0');
+            }
+            c.from = value;
+        }
+        c.kind = Kind::Log;
+        return c;
+    }
     if (words[0] == "remove" && words.size() == 2) {
         if (!Number(words[1], c.id) || c.id == 0) {
             return Invalid("a monitor id");

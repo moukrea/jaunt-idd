@@ -17,6 +17,9 @@
 #include <avrt.h>
 #include <wrl.h>
 
+#include "edid.h"
+#include "log.h"
+
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -29,13 +32,16 @@ namespace jaunt_idd {
 
 class Driver;
 
-// What Windows asked of the driver, for the pipe's `status`: counts, the render adapter of the last
-// swap chain, and the last results of making its D3D device and handing it to the swap chain
-// (E_PENDING: not yet).
+// What Windows asked of the driver, for the pipe's `status` and `log`: counts, the render adapter of
+// the last swap chain, the last results of making its D3D device and handing it to the swap chain
+// (E_PENDING: not yet), where Windows exposed the last monitor, and the bounded log of every
+// callback and Windows call.
 struct Trace {
     std::atomic<uint32_t> DefaultModes{0}, TargetModes{0}, Commits{0}, CommitPaths{0}, ActivePaths{0};
     std::atomic<uint32_t> SwapChains{0}, Unassigned{0}, Frames{0}, RenderLow{0};
-    std::atomic<long> RenderHigh{0}, Device{E_PENDING}, SetDevice{E_PENDING};
+    std::atomic<uint32_t> ParsedEdids{0}, Arrivals{0}, OsLow{0}, OsTarget{0};
+    std::atomic<long> RenderHigh{0}, Device{E_PENDING}, SetDevice{E_PENDING}, OsHigh{0};
+    EventLog events;
     // What DXGI listed to the driver: "<vendor>:<device>:<flags>:<luid>,..." (written once, before
     // the pipe opens; "-": DXGI could not be asked).
     char Adapters[400] = "-";
@@ -80,6 +86,11 @@ struct Monitor {
     uint32_t Refresh = 60;
     uint32_t Connection = 0;
     uint32_t Connector = 0;  // the adapter's connector: 0 to MAX_MONITORS - 1, free again once it goes
+    uint32_t Serial = 0;     // in its EDID: tells the monitors present at once apart
+    std::vector<Mode> Modes;  // its mode list, the same for its EDID's parse and for its target modes
+    Edid EdidBlock{};         // announced at its creation (edid.h); Windows reads it while it arrives
+    LUID OsLuid = {};         // where Windows exposed it (IddCxMonitorArrival): adapter and target
+    uint32_t OsTargetId = 0;
     IDDCX_MONITOR Object = nullptr;
     std::unique_ptr<SwapChainProcessor> Processor;
 };
@@ -100,7 +111,9 @@ public:
 
     // IddCx callbacks.
     bool ModeOf(uint32_t monitorId, uint32_t& width, uint32_t& height, uint32_t& refresh);
-    void AssignSwapChain(uint32_t monitorId, IDDCX_SWAPCHAIN swapChain, LUID renderAdapter, HANDLE newFrameEvent);
+    // A monitor's mode list, by id or by the serial in its EDID; false for a monitor not known.
+    bool ModesOfId(uint32_t monitorId, std::vector<Mode>& modes);
+    bool ModesOfSerial(uint32_t serial, std::vector<Mode>& modes);    void AssignSwapChain(uint32_t monitorId, IDDCX_SWAPCHAIN swapChain, LUID renderAdapter, HANDLE newFrameEvent);
     void UnassignSwapChain(uint32_t monitorId);
 
     WDFDEVICE WdfDevice() const { return m_WdfDevice; }

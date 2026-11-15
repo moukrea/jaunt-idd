@@ -68,10 +68,10 @@ DISPLAYCONFIG_VIDEO_SIGNAL_INFO SignalInfo(uint32_t width, uint32_t height, uint
     return s;
 }
 
-IDDCX_MONITOR_MODE MonitorMode(uint32_t width, uint32_t height, uint32_t refresh) {
+IDDCX_MONITOR_MODE MonitorMode(uint32_t width, uint32_t height, uint32_t refresh, IDDCX_MONITOR_MODE_ORIGIN origin) {
     IDDCX_MONITOR_MODE mode = {};
     mode.Size = sizeof(mode);
-    mode.Origin = IDDCX_MONITOR_MODE_ORIGIN_DRIVER;
+    mode.Origin = origin;
     mode.MonitorVideoSignalInfo = SignalInfo(width, height, refresh, 0);
     return mode;
 }
@@ -80,10 +80,22 @@ IDDCX_TARGET_MODE TargetMode(uint32_t width, uint32_t height, uint32_t refresh) 
     IDDCX_TARGET_MODE mode = {};
     mode.Size = sizeof(mode);
     mode.TargetVideoSignalInfo.targetVideoSignalInfo = SignalInfo(width, height, refresh, 1);
-    // As Microsoft's sample: the mode's pipeline rate (the adapter declares no limit).
-    mode.RequiredBandwidth = static_cast<UINT64>(refresh) * width * height;
+    // Zero, as Microsoft's sample leaves it. IddCx.h: the OS never picks modes whose bandwidths add
+    // up to more than the adapter's MaxDisplayPipelineRate, which this adapter leaves at zero (no
+    // limit, "if the driver does not have these restrictions then it can set all bandwidths to
+    // zero"): a bandwidth above zero against a limit of zero is a mode no path could take. (0.2.0
+    // stated width * height * refresh here.)
+    mode.RequiredBandwidth = 0;
     return mode;
 }
+
+// The driver (one device per host process), for the callbacks Windows makes without a monitor or an
+// adapter in their arguments (parsing an EDID).
+std::atomic<Driver*> g_Driver{nullptr};
+
+// "<high>:<low>", a LUID as the status and the log write it.
+#define LUID_FORMAT "%08X:%08X"
+#define LUID_ARGS(luid) static_cast<unsigned>((luid).HighPart), static_cast<unsigned>((luid).LowPart)
 
 // An error from a Windows call, with its status for the pipe: "<what> (0x<NTSTATUS>)".
 std::wstring WithStatus(const wchar_t* what, NTSTATUS status) {
@@ -159,37 +171,48 @@ NTSTATUS JauntDeviceAdd(WDFDRIVER, PWDFDEVICE_INIT deviceInit) {
     attributes.EvtCleanupCallback = [](WDFOBJECT object) {
         auto* context = WdfObjectGet_JauntDeviceContext(object);
         if (context) {
-            delete context->pDriver;
+            Driver* gone = context->pDriver;
+            Driver* expected = gone;
+            g_Driver.compare_exchange_strong(expected, nullptr);
+            delete gone;
             context->pDriver = nullptr;
         }
     };
     WDFDEVICE device = nullptr;
-    status = WdfDeviceCreate(&deviceInit, &attributes, &device);
-    if (!NT_SUCCESS(status)) {
-        return status;
+    const NTSTATUS created = WdfDeviceCreate(&deviceInit, &attributes, &device);
+    if (!NT_SUCCESS(created)) {
+        return created;
     }
-    status = IddCxDeviceInitialize(device);
-    if (!NT_SUCCESS(status)) {
-        return status;
+    const NTSTATUS initialized = IddCxDeviceInitialize(device);
+    if (!NT_SUCCESS(initialized)) {
+        return initialized;
     }
-    WdfObjectGet_JauntDeviceContext(device)->pDriver = new Driver(device);
+    auto* driver = new Driver(device);
+    WdfObjectGet_JauntDeviceContext(device)->pDriver = driver;
+    g_Driver = driver;
+    driver->trace.events.Add("DeviceAdd: IddCxDeviceInitConfig 0x%08X, WdfDeviceCreate 0x%08X, IddCxDeviceInitialize 0x%08X", static_cast<unsigned>(status),
+                             static_cast<unsigned>(created), static_cast<unsigned>(initialized));
     return STATUS_SUCCESS;
 }
 
-NTSTATUS JauntDeviceD0Entry(WDFDEVICE device, WDF_POWER_DEVICE_STATE) {
-    WdfObjectGet_JauntDeviceContext(device)->pDriver->InitAdapter();
+NTSTATUS JauntDeviceD0Entry(WDFDEVICE device, WDF_POWER_DEVICE_STATE previous) {
+    Driver* driver = WdfObjectGet_JauntDeviceContext(device)->pDriver;
+    driver->trace.events.Add("D0Entry: from power state %d", static_cast<int>(previous));
+    driver->InitAdapter();
     return STATUS_SUCCESS;
 }
 
 NTSTATUS JauntAdapterInitFinished(IDDCX_ADAPTER adapter, const IDARG_IN_ADAPTER_INIT_FINISHED* args) {
+    Driver* driver = WdfObjectGet_JauntDeviceContext(adapter)->pDriver;
+    driver->trace.events.Add("AdapterInitFinished: AdapterInitStatus 0x%08X", static_cast<unsigned>(args->AdapterInitStatus));
     if (NT_SUCCESS(args->AdapterInitStatus)) {
-        WdfObjectGet_JauntDeviceContext(adapter)->pDriver->FinishInit();
+        driver->FinishInit();
     }
     return STATUS_SUCCESS;
 }
 
 NTSTATUS JauntAdapterCommitModes(IDDCX_ADAPTER adapter, const IDARG_IN_COMMITMODES* in) {
-    // Nothing to set up for a mode here; counted for `status`.
+    // Nothing to set up for a mode here; counted for `status`, each path written to the log.
     Driver* driver = WdfObjectGet_JauntDeviceContext(adapter)->pDriver;
     if (driver) {
         uint32_t active = 0;
@@ -201,43 +224,104 @@ NTSTATUS JauntAdapterCommitModes(IDDCX_ADAPTER adapter, const IDARG_IN_COMMITMOD
         driver->trace.Commits++;
         driver->trace.CommitPaths = in->PathCount;
         driver->trace.ActivePaths = active;
+        driver->trace.events.Add("CommitModes: %u paths, %u active", static_cast<unsigned>(in->PathCount), static_cast<unsigned>(active));
+        for (UINT i = 0; i < in->PathCount && i < MAX_MONITORS; ++i) {
+            const IDDCX_PATH& path = in->pPaths[i];
+            uint32_t id = 0;
+            if (path.MonitorObject != nullptr) {
+                id = WdfObjectGet_JauntMonitorContext(path.MonitorObject)->MonitorId;
+            }
+            const auto& signal = path.TargetVideoSignalInfo;
+            driver->trace.events.Add("CommitModes: path %u monitor %u flags 0x%X active %ux%u vsync %u/%u divider %u", static_cast<unsigned>(i),
+                                     static_cast<unsigned>(id), static_cast<unsigned>(path.Flags), static_cast<unsigned>(signal.activeSize.cx),
+                                     static_cast<unsigned>(signal.activeSize.cy), static_cast<unsigned>(signal.vSyncFreq.Numerator),
+                                     static_cast<unsigned>(signal.vSyncFreq.Denominator), static_cast<unsigned>(signal.AdditionalSignalInfo.vSyncFreqDivider));
+        }
     }
     return STATUS_SUCCESS;
 }
 
-// Monitors are made without an EDID (any mode, up to 8192 a side): Windows asks for their modes
-// below instead.
-NTSTATUS JauntParseMonitorDescription(const IDARG_IN_PARSEMONITORDESCRIPTION*, IDARG_OUT_PARSEMONITORDESCRIPTION* out) {
-    out->MonitorModeBufferOutputCount = 0;
-    return STATUS_INVALID_PARAMETER;
-}
-
-NTSTATUS JauntMonitorGetDefaultModes(IDDCX_MONITOR monitor, const IDARG_IN_GETDEFAULTDESCRIPTIONMODES* in, IDARG_OUT_GETDEFAULTDESCRIPTIONMODES* out) {
-    uint32_t id = 0, width = 0, height = 0, refresh = 0;
-    Driver* driver = DriverOf(monitor, id);
-    driver->trace.DefaultModes++;
-    if (!driver->ModeOf(id, width, height, refresh)) {
+// Windows asks the driver for the modes of an EDID (parsing it is the driver's): ours, made in
+// AddMonitor, is known by its serial; the modes are the monitor's own list, the one its target modes
+// give too.
+NTSTATUS JauntParseMonitorDescription(const IDARG_IN_PARSEMONITORDESCRIPTION* in, IDARG_OUT_PARSEMONITORDESCRIPTION* out) {
+    Driver* driver = g_Driver;
+    const auto& description = in->MonitorDescription;
+    uint32_t serial = 0;
+    Mode described;
+    const bool ours = ReadEdid(static_cast<const uint8_t*>(description.pData), description.DataSize, serial, described);
+    if (driver) {
+        driver->trace.ParsedEdids++;
+    }
+    std::vector<Mode> modes;
+    if (ours) {
+        if (driver == nullptr || !driver->ModesOfSerial(serial, modes)) {
+            modes.assign(1, described);  // an EDID of ours, of no monitor now: its own timing
+        }
+    }
+    if (driver) {
+        driver->trace.events.Add("ParseMonitorDescription: type %d size %u, ours %d serial %08X, %u modes, buffer of %u", static_cast<int>(description.Type),
+                                 static_cast<unsigned>(description.DataSize), ours ? 1 : 0, static_cast<unsigned>(serial), static_cast<unsigned>(modes.size()),
+                                 static_cast<unsigned>(in->MonitorModeBufferInputCount));
+    }
+    out->MonitorModeBufferOutputCount = static_cast<UINT>(modes.size());
+    out->PreferredMonitorModeIdx = 0;
+    if (!ours) {
         return STATUS_INVALID_PARAMETER;
     }
-    out->DefaultMonitorModeBufferOutputCount = 1;
+    if (in->MonitorModeBufferInputCount < modes.size()) {
+        // No buffer: the caller asks for the count only.
+        return in->MonitorModeBufferInputCount > 0 ? STATUS_BUFFER_TOO_SMALL : STATUS_SUCCESS;
+    }
+    for (size_t i = 0; i < modes.size(); ++i) {
+        // The mode the EDID's timing states comes from the description; one it cannot state (a side
+        // over 4095) is the driver's.
+        in->pMonitorModes[i] = MonitorMode(modes[i].width, modes[i].height, modes[i].refresh,
+                                           modes[i].described ? IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR : IDDCX_MONITOR_MODE_ORIGIN_DRIVER);
+    }
+    return STATUS_SUCCESS;
+}
+
+// Only for a monitor without an EDID, which this driver never makes: here for completeness, and
+// logged in case Windows asks.
+NTSTATUS JauntMonitorGetDefaultModes(IDDCX_MONITOR monitor, const IDARG_IN_GETDEFAULTDESCRIPTIONMODES* in, IDARG_OUT_GETDEFAULTDESCRIPTIONMODES* out) {
+    uint32_t id = 0;
+    Driver* driver = DriverOf(monitor, id);
+    driver->trace.DefaultModes++;
+    std::vector<Mode> modes;
+    const bool known = driver->ModesOfId(id, modes);
+    driver->trace.events.Add("GetDefaultDescriptionModes: monitor %u known %d, %u modes, buffer of %u", static_cast<unsigned>(id), known ? 1 : 0,
+                             static_cast<unsigned>(modes.size()), static_cast<unsigned>(in->DefaultMonitorModeBufferInputCount));
+    if (!known) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    out->DefaultMonitorModeBufferOutputCount = static_cast<UINT>(modes.size());
     out->PreferredMonitorModeIdx = 0;
-    if (in->DefaultMonitorModeBufferInputCount == 0) {
+    if (in->DefaultMonitorModeBufferInputCount < modes.size()) {
         return STATUS_SUCCESS;  // asked for the count only
     }
-    in->pDefaultMonitorModes[0] = MonitorMode(width, height, refresh);
+    for (size_t i = 0; i < modes.size(); ++i) {
+        in->pDefaultMonitorModes[i] = MonitorMode(modes[i].width, modes[i].height, modes[i].refresh, IDDCX_MONITOR_MODE_ORIGIN_DRIVER);
+    }
     return STATUS_SUCCESS;
 }
 
 NTSTATUS JauntMonitorQueryModes(IDDCX_MONITOR monitor, const IDARG_IN_QUERYTARGETMODES* in, IDARG_OUT_QUERYTARGETMODES* out) {
-    uint32_t id = 0, width = 0, height = 0, refresh = 0;
+    uint32_t id = 0;
     Driver* driver = DriverOf(monitor, id);
     driver->trace.TargetModes++;
-    if (!driver->ModeOf(id, width, height, refresh)) {
+    std::vector<Mode> modes;
+    const bool known = driver->ModesOfId(id, modes);
+    driver->trace.events.Add("QueryTargetModes: monitor %u known %d, %u modes, buffer of %u", static_cast<unsigned>(id), known ? 1 : 0,
+                             static_cast<unsigned>(modes.size()), static_cast<unsigned>(in->TargetModeBufferInputCount));
+    if (!known) {
         return STATUS_INVALID_PARAMETER;
     }
-    out->TargetModeBufferOutputCount = 1;
-    if (in->TargetModeBufferInputCount >= 1) {
-        in->pTargetModes[0] = TargetMode(width, height, refresh);
+    out->TargetModeBufferOutputCount = static_cast<UINT>(modes.size());
+    if (in->TargetModeBufferInputCount >= modes.size()) {
+        for (size_t i = 0; i < modes.size(); ++i) {
+            in->pTargetModes[i] = TargetMode(modes[i].width, modes[i].height, modes[i].refresh);
+        }
     }
     return STATUS_SUCCESS;
 }
@@ -311,6 +395,7 @@ void SwapChainProcessor::RunCore() {
     setDevice.pDevice = dxgiDevice.Get();
     HRESULT set = IddCxSwapChainSetDevice(m_SwapChain, &setDevice);
     m_Trace->SetDevice = set;
+    m_Trace->events.Add("swap chain: IddCxSwapChainSetDevice 0x%08X", static_cast<unsigned>(set));
     if (FAILED(set)) {
         return;
     }
@@ -323,15 +408,21 @@ void SwapChainProcessor::RunCore() {
             if (wait == WAIT_OBJECT_0 || wait == WAIT_TIMEOUT) {
                 continue;
             }
+            m_Trace->events.Add("swap chain: stopped (wait %u)", static_cast<unsigned>(wait));
             break;  // terminating, or the wait failed
         }
         if (FAILED(hr)) {
+            m_Trace->events.Add("swap chain: IddCxSwapChainReleaseAndAcquireBuffer 0x%08X, done", static_cast<unsigned>(hr));
             break;  // the swap chain is gone (a new one comes with the next assignment)
         }
         // Nothing to do with the picture here: the desktop is read where it is shown.
         buffer.MetaData.pSurface->Release();
-        m_Trace->Frames++;
-        if (FAILED(IddCxSwapChainFinishedProcessingFrame(m_SwapChain))) {
+        if (m_Trace->Frames++ == 0) {
+            m_Trace->events.Add("swap chain: first frame");
+        }
+        const HRESULT finished = IddCxSwapChainFinishedProcessingFrame(m_SwapChain);
+        if (FAILED(finished)) {
+            m_Trace->events.Add("swap chain: IddCxSwapChainFinishedProcessingFrame 0x%08X, done", static_cast<unsigned>(finished));
             break;
         }
     }
@@ -371,6 +462,8 @@ void Driver::InitAdapter() {
     init.ObjectAttributes = &attributes;
     IDARG_OUT_ADAPTER_INIT out = {};
     m_AdapterStatus = IddCxAdapterInitAsync(&init, &out);
+    trace.events.Add("IddCxAdapterInitAsync 0x%08X: up to %u monitors, no pipeline limit (MaxDisplayPipelineRate 0), flags 0x%X",
+                     static_cast<unsigned>(m_AdapterStatus), static_cast<unsigned>(caps.MaxMonitorsSupported), static_cast<unsigned>(caps.Flags));
     if (NT_SUCCESS(m_AdapterStatus)) {
         m_Adapter = out.AdapterObject;
         WdfObjectGet_JauntDeviceContext(out.AdapterObject)->pDriver = this;
@@ -379,6 +472,7 @@ void Driver::InitAdapter() {
 
 void Driver::FinishInit() {
     ListRenderAdapters(trace.Adapters, sizeof(trace.Adapters));  // for `status`, before the pipe opens
+    trace.events.Add("render adapters DXGI lists (vendor:device:flags:luid): %s", trace.Adapters);
     // No monitor until the agent asks for one: the control pipe, open to SYSTEM and the account
     // the installer named.
     m_Pipe = std::make_unique<ControlPipe>(this, AllowedSid(m_WdfDevice));
@@ -412,6 +506,16 @@ uint32_t Driver::AddMonitor(uint32_t width, uint32_t height, uint32_t refresh, u
     monitor->Height = height;
     monitor->Refresh = refresh;
     monitor->Connection = connection;
+    // Its EDID and the modes it gives rise to: one source for the EDID's parse and the target modes.
+    monitor->Serial = SerialFor(connector, width, height, refresh);
+    monitor->EdidBlock = MakeEdid(width, height, refresh, monitor->Serial);
+    monitor->Modes = ModeList(width, height, refresh);
+    const uint32_t id = monitor->Id;
+    trace.events.Add("add %ux%u@%u for connection %u: monitor %u on connector %u, EDID serial %08X, %u modes (first %ux%u@%u)", static_cast<unsigned>(width),
+                     static_cast<unsigned>(height), static_cast<unsigned>(refresh), static_cast<unsigned>(connection), static_cast<unsigned>(id),
+                     static_cast<unsigned>(connector), static_cast<unsigned>(monitor->Serial), static_cast<unsigned>(monitor->Modes.size()),
+                     static_cast<unsigned>(monitor->Modes[0].width), static_cast<unsigned>(monitor->Modes[0].height),
+                     static_cast<unsigned>(monitor->Modes[0].refresh));
 
     WDF_OBJECT_ATTRIBUTES attributes;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, JauntMonitorContext);
@@ -422,24 +526,32 @@ uint32_t Driver::AddMonitor(uint32_t width, uint32_t height, uint32_t refresh, u
     info.ConnectorIndex = connector;  // 0 to MaxMonitorsSupported - 1 (IddCx.h)
     info.MonitorDescription.Size = sizeof(info.MonitorDescription);
     info.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
-    info.MonitorDescription.DataSize = 0;  // no EDID: its modes come from the callbacks
-    info.MonitorDescription.pData = nullptr;
+    info.MonitorDescription.DataSize = static_cast<UINT>(monitor->EdidBlock.size());  // 128 bytes: see edid.h
+    info.MonitorDescription.pData = monitor->EdidBlock.data();
     CoCreateGuid(&info.MonitorContainerId);
     IDARG_IN_MONITORCREATE create = {};
     create.ObjectAttributes = &attributes;
     create.pMonitorInfo = &info;
     IDARG_OUT_MONITORCREATE created = {};
-    // Its modes are read while it arrives: it is listed first.
+    // Its modes are read while it is created and arrives: it is listed first, and the lock is not
+    // held meanwhile (Windows asks for them from another thread, or from this one).
     Monitor* raw = monitor.get();
     m_Monitors.push_back(std::move(monitor));
+    lock.unlock();
     NTSTATUS status = IddCxMonitorCreate(m_Adapter, &create, &created);
+    lock.lock();
+    trace.events.Add("monitor %u: IddCxMonitorCreate 0x%08X", static_cast<unsigned>(id), static_cast<unsigned>(status));
     if (!NT_SUCCESS(status)) {
-        m_Monitors.pop_back();
+        for (auto it = m_Monitors.begin(); it != m_Monitors.end(); ++it) {
+            if ((*it)->Id == id) {
+                m_Monitors.erase(it);
+                break;
+            }
+        }
         error = WithStatus(L"IddCxMonitorCreate failed", status);
         return 0;
     }
     raw->Object = created.MonitorObject;
-    const uint32_t id = raw->Id;
     auto* context = WdfObjectGet_JauntMonitorContext(created.MonitorObject);
     context->pDriver = this;
     context->MonitorId = id;
@@ -447,6 +559,8 @@ uint32_t Driver::AddMonitor(uint32_t width, uint32_t height, uint32_t refresh, u
     lock.unlock();  // Windows asks for its modes from another thread meanwhile
     status = IddCxMonitorArrival(created.MonitorObject, &arrival);
     lock.lock();
+    trace.events.Add("monitor %u: IddCxMonitorArrival 0x%08X, OsAdapterLuid " LUID_FORMAT ", OsTargetId %u", static_cast<unsigned>(id),
+                     static_cast<unsigned>(status), LUID_ARGS(arrival.OsAdapterLuid), static_cast<unsigned>(arrival.OsTargetId));
     if (!NT_SUCCESS(status)) {
         for (auto it = m_Monitors.begin(); it != m_Monitors.end(); ++it) {
             if ((*it)->Id == id) {
@@ -458,6 +572,12 @@ uint32_t Driver::AddMonitor(uint32_t width, uint32_t height, uint32_t refresh, u
         error = WithStatus(L"IddCxMonitorArrival failed", status);
         return 0;
     }
+    raw->OsLuid = arrival.OsAdapterLuid;
+    raw->OsTargetId = arrival.OsTargetId;
+    trace.Arrivals++;
+    trace.OsLow = arrival.OsAdapterLuid.LowPart;
+    trace.OsHigh = arrival.OsAdapterLuid.HighPart;
+    trace.OsTarget = arrival.OsTargetId;
     return id;
 }
 
@@ -480,6 +600,7 @@ bool Driver::RemoveMonitor(uint32_t id, uint32_t connection, std::wstring& error
         return false;
     }
     NTSTATUS status = IddCxMonitorDeparture(object);
+    trace.events.Add("monitor %u: IddCxMonitorDeparture 0x%08X", static_cast<unsigned>(id), static_cast<unsigned>(status));
     if (!NT_SUCCESS(status)) {
         error = WithStatus(L"IddCxMonitorDeparture failed", status);
         return false;
@@ -516,6 +637,28 @@ bool Driver::ModeOf(uint32_t monitorId, uint32_t& width, uint32_t& height, uint3
     return false;
 }
 
+bool Driver::ModesOfId(uint32_t monitorId, std::vector<Mode>& modes) {
+    std::lock_guard<std::mutex> lock(m_Lock);
+    for (auto& m : m_Monitors) {
+        if (m->Id == monitorId) {
+            modes = m->Modes;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Driver::ModesOfSerial(uint32_t serial, std::vector<Mode>& modes) {
+    std::lock_guard<std::mutex> lock(m_Lock);
+    for (auto& m : m_Monitors) {
+        if (m->Serial == serial) {
+            modes = m->Modes;
+            return true;
+        }
+    }
+    return false;
+}
+
 void Driver::AssignSwapChain(uint32_t monitorId, IDDCX_SWAPCHAIN swapChain, LUID renderAdapter, HANDLE newFrameEvent) {
     std::lock_guard<std::mutex> lock(m_Lock);
     for (auto& m : m_Monitors) {
@@ -529,6 +672,8 @@ void Driver::AssignSwapChain(uint32_t monitorId, IDDCX_SWAPCHAIN swapChain, LUID
         auto device = std::make_shared<Direct3DDevice>(renderAdapter);
         HRESULT made = device->Init();
         trace.Device = made;
+        trace.events.Add("AssignSwapChain: monitor %u, render adapter " LUID_FORMAT ", Direct3D device 0x%08X", static_cast<unsigned>(monitorId),
+                         LUID_ARGS(renderAdapter), static_cast<unsigned>(made));
         if (FAILED(made)) {
             // The system tries another adapter once this swap chain is gone.
             WdfObjectDelete(reinterpret_cast<WDFOBJECT>(swapChain));
@@ -537,11 +682,13 @@ void Driver::AssignSwapChain(uint32_t monitorId, IDDCX_SWAPCHAIN swapChain, LUID
         m->Processor = std::make_unique<SwapChainProcessor>(swapChain, device, newFrameEvent, &trace);
         return;
     }
+    trace.events.Add("AssignSwapChain: monitor %u is not known, swap chain deleted", static_cast<unsigned>(monitorId));
     WdfObjectDelete(reinterpret_cast<WDFOBJECT>(swapChain));
 }
 
 void Driver::UnassignSwapChain(uint32_t monitorId) {
     trace.Unassigned++;
+    trace.events.Add("UnassignSwapChain: monitor %u", static_cast<unsigned>(monitorId));
     std::lock_guard<std::mutex> lock(m_Lock);
     for (auto& m : m_Monitors) {
         if (m->Id == monitorId) {
@@ -556,13 +703,15 @@ std::string Driver::Status() {
         std::lock_guard<std::mutex> lock(m_Lock);
         monitors = m_Monitors.size();
     }
-    char text[1100];
+    char text[1300];
+    // os=<adapter LUID>/<target id>: where Windows exposed the last monitor that arrived (0 arrivals: zeros).
     snprintf(text, sizeof(text),
              "ok adapter=0x%08X monitors=%u modes=%u targets=%u commits=%u paths=%u active=%u swapchains=%u render=%08X:%08X device=0x%08X "
-             "setdevice=0x%08X frames=%u unassigned=%u dxgi=%s\n",
+             "setdevice=0x%08X frames=%u unassigned=%u edids=%u arrivals=%u os=%08X:%08X/%u dxgi=%s\n",
              static_cast<unsigned>(m_AdapterStatus), static_cast<unsigned>(monitors), trace.DefaultModes.load(), trace.TargetModes.load(),
              trace.Commits.load(), trace.CommitPaths.load(), trace.ActivePaths.load(), trace.SwapChains.load(),
              static_cast<unsigned>(trace.RenderHigh.load()), trace.RenderLow.load(), static_cast<unsigned>(trace.Device.load()),
-             static_cast<unsigned>(trace.SetDevice.load()), trace.Frames.load(), trace.Unassigned.load(), trace.Adapters);
+             static_cast<unsigned>(trace.SetDevice.load()), trace.Frames.load(), trace.Unassigned.load(), trace.ParsedEdids.load(), trace.Arrivals.load(),
+             static_cast<unsigned>(trace.OsHigh.load()), trace.OsLow.load(), trace.OsTarget.load(), trace.Adapters);
     return text;
 }
