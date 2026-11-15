@@ -363,9 +363,9 @@ function Up($upConnection, [string]$upSize) {
     $upActive = ActiveOn (OsOf (Ask $upConnection "status")) $upSize
     if ($upActive.Count -and (Shown $upSize).Count) { $upActive } else { $null }
 }
-function Connect {
+function Connect([int]$connectMs = 5000) {
     $pipe = New-Object IO.Pipes.NamedPipeClientStream(".", "jaunt-idd", [IO.Pipes.PipeDirection]::InOut)
-    $pipe.Connect(5000)
+    $pipe.Connect($connectMs)
     $pipe.ReadMode = [IO.Pipes.PipeTransmissionMode]::Message
     return $pipe
 }
@@ -521,6 +521,24 @@ try {
         $pong = Ask $pipe "ping"
         $refused = Ask $pipe "add 100 100 60"
         Step "ping answered, a size out of range refused" ($pong -eq "pong" -and $refused -like "error *") ([ordered]@{ ping = $pong; add100 = $refused })
+        # Two connections at once: the driver makes the next instance while one is connected (it
+        # always holds one, so the name is never free for another program), and serves both.
+        # (The first connection is pinged just before, and the second waited for 2 s at most: the
+        # watchdog, 5 s, never closes the first meanwhile.)
+        $second = $null
+        $both = [ordered]@{}
+        try {
+            $null = Ask $pipe "ping"
+            $second = Connect 2000
+            $both.second = Ask $second "ping"
+            $both.first = Ask $pipe "ping"
+        } catch { $both.error = $_.Exception.Message }
+        if ($second) { $second.Dispose() }
+        try { $null = Ask $pipe "ping" } catch { $pipe.Dispose(); $pipe = Connect }  # the first connection kept, or a new one
+        $both.pipeLog = @(DriverLog $pipe | Where-Object { $_ -match "pipe: " })
+        $nextRefused = @($both.pipeLog | Where-Object { $_ -match "next instance cannot be made|first instance cannot be made" })
+        Step "two connections at once, both answered; the next instance made each time" ($both.second -eq "pong" -and $both.first -eq "pong" -and -not $nextRefused.Count) `
+            ([ordered]@{ answers = $both; driverLogSays = $nextRefused })
 
         # ---- a silent connection loses its monitor (the watchdog, 5 s) ---------------------------
         $added = Ask $pipe "add 1280 720 60"
