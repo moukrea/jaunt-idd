@@ -50,7 +50,7 @@ jobs:
       # removed with the topology back; the watchdog) and uninstalled (tests/load_test.ps1). The
       # driver's own log and the steps' details are in the job's artifact (out/load-driver.log,
       # out/load-test.log).
-      - name: The driver loaded and used: a monitor that becomes an active display
+      - name: The driver loaded and used, a monitor made an active display
         if: matrix.platform == 'x64'
         timeout-minutes: 20
         shell: pwsh
