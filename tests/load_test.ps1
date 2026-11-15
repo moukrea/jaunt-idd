@@ -597,6 +597,9 @@ catch { "OTHER " + $_.Exception.GetType().Name + ": " + $_.Exception.Message }
         # opened within 2 s each: the watchdog, 5 s, closes none meanwhile.)
         $others = @()
         $answers = @()
+        # (The probes above took longer than the watchdog's 5 s: a connection of its own, new.)
+        $pipe.Dispose()
+        $pipe = Connect
         try {
             $null = Ask $pipe "ping"
             foreach ($n in 1..9) { $others += Connect 2000 }
