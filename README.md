@@ -18,17 +18,19 @@ Driver (NOTICE.md).
   nearest one a timing holds, and stays the monitor's preferred mode. Up to 8 monitors at once, one
   per connector of the adapter; a monitor that goes frees its connector.
 - **Who may ask:** the pipe's security descriptor lets SYSTEM and one account open it, the one named
-  at installation (`AllowedUser`, a SID, in the device's hardware key), besides the driver's own
-  host account (below). No one else: not Everyone, not Administrators, not the other accounts signed
-  in, not remote clients (`PIPE_REJECT_REMOTE_CLIENTS`). Its first instance is made
-  with `FILE_FLAG_FIRST_PIPE_INSTANCE`, so the driver never joins a pipe of that name another
-  program made first, and it always holds an instance (the next one is made before a connected one
-  is handed over), so the name is never free for another program between two connections. For that
-  the pipe's owner, the account the driver's host runs as (LocalService), may read and write it
-  through OWNER RIGHTS: Windows checks that access each time an instance after the first is made.
-  Other services running as LocalService match that entry too; the programs of the person signed in
-  do not. Without that value, SYSTEM
-  only.
+  at installation (`AllowedUser`, a SID, in the device's hardware key). No one else: not Everyone,
+  not Administrators, not other services, not remote clients (`PIPE_REJECT_REMOTE_CLIENTS`). Without
+  that value, SYSTEM only. What an opener can do is the protocol below: add and remove its own
+  monitors (a connection removes only the monitors it made), `ping`, and read `status` and `log`.
+- **The name stays the driver's:** its first instance is made with `FILE_FLAG_FIRST_PIPE_INSTANCE`,
+  so the driver never joins a pipe of that name another program made first; then it makes a fixed
+  pool of 16 instances at once and reuses them for ever (each disconnected and waiting again), so the
+  name is never free and no instance is made later. Windows checks the pipe's DACL for every instance
+  after the first, and the driver's host runs as LocalService, which the DACL above does not name:
+  the pool is made under a startup DACL that also lets the pipe's owner (OWNER RIGHTS, that account)
+  read, write and change it, then the DACL above replaces it, and one more instance is tried and must
+  be refused (the driver log says so; the load test checks the DACL Windows holds). Only during that
+  moment of the driver's start could another service running as LocalService make an instance.
 - **A monitor never outlives the program that asked for it:** each connection's monitors are removed
   when it closes, when its process ends, or when it sends nothing for 5 seconds (the watchdog; jaunt
   pings every second). A connection removes only its own monitors.

@@ -1,14 +1,26 @@
 // jaunt's indirect display driver: the control pipe (\\.\pipe\jaunt-idd) and its watchdog.
 //
-// Its security descriptor lets SYSTEM and one account (the installer's `AllowedUser`) open it, no
-// one else: no Everyone, no Administrators beyond SYSTEM, no network logon (a remote client is
-// refused, PIPE_REJECT_REMOTE_CLIENTS). Each connection's monitors are removed when it closes, or
-// when it sends nothing for WATCHDOG_MS (the agent pings every second): a monitor never outlives the
+// Who may open it: SYSTEM and one account (the installer's `AllowedUser`), no one else: no
+// Everyone, no Administrators beyond SYSTEM, no other service, no network logon (a remote client is
+// refused, PIPE_REJECT_REMOTE_CLIENTS). Each connection's monitors are removed when it closes, or when
+// it sends nothing for WATCHDOG_MS (the agent pings every second): a monitor never outlives the
 // program that asked for it.
+//
+// How the name stays the driver's: the first instance is made with FILE_FLAG_FIRST_PIPE_INSTANCE (if
+// another program made a pipe of this name first, creation fails, and the driver never joins it), then
+// a fixed pool of PIPE_INSTANCES instances is made at once and reused for ever (each disconnected and
+// connected again), so the name is never free and no instance is ever made later. Windows checks the
+// pipe's DACL each time an instance after the first is made (the open mode's read and write), and the
+// driver's host runs as LocalService, which the final DACL does not name: so the pool is made under a
+// startup DACL that also grants the pipe's owner (OWNER RIGHTS) read, write and WRITE_DAC, then the
+// DACL is replaced by the final one (SYSTEM and the allowed account), and one more instance is tried
+// and must be refused (logged). Any service running as LocalService could make an instance only in
+// that moment of the driver's start; none can afterwards.
 // SPDX-License-Identifier: MIT
 #include "driver.h"
 #include "protocol.h"
 
+#include <aclapi.h>
 #include <sddl.h>
 
 #include <string>
@@ -19,6 +31,9 @@ using namespace jaunt_idd;
 namespace {
 
 constexpr wchar_t PIPE_NAME[] = L"\\\\.\\pipe\\jaunt-idd";
+// Connections at once: a monitor each (MAX_MONITORS), and room for the agent's own checks and for
+// `status` and `log`.
+constexpr size_t PIPE_INSTANCES = 2 * MAX_MONITORS;
 
 std::string Narrow(const std::wstring& text) {
     std::string out;
@@ -39,8 +54,8 @@ std::string SidText(PSID sid) {
 }
 
 // What the driver's host process is (the pipe's creator and owner), for the log: its token's user,
-// owner, integrity level, and whether it is restricted (with its restricting SIDs). Well-known
-// service SIDs, no person's.
+// owner, integrity level, whether it is restricted, and its groups (the principals a narrower DACL
+// entry could name). Well-known and service SIDs, no person's.
 void LogHostToken(Driver* driver) {
     HANDLE token = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
@@ -60,95 +75,179 @@ void LogHostToken(Driver* driver) {
         }
         return data;
     };
-    std::vector<BYTE> user = query(TokenUser), owner = query(TokenOwner), label = query(TokenIntegrityLevel), restricting = query(TokenRestrictedSids);
-    std::string restrictedSids;
-    if (!restricting.empty()) {
-        const auto* groups = reinterpret_cast<const TOKEN_GROUPS*>(restricting.data());
-        for (DWORD i = 0; i < groups->GroupCount && i < 6; ++i) {
-            restrictedSids += (i ? "," : "") + SidText(groups->Groups[i].Sid);
-        }
-    }
-    driver->trace.events.Add("pipe: host token user %s owner %s integrity %s restricted %d (%s)",
+    std::vector<BYTE> user = query(TokenUser), owner = query(TokenOwner), label = query(TokenIntegrityLevel), groups = query(TokenGroups);
+    driver->trace.events.Add("pipe: host token user %s owner %s integrity %s restricted %d",
                              user.empty() ? "?" : SidText(reinterpret_cast<const TOKEN_USER*>(user.data())->User.Sid).c_str(),
                              owner.empty() ? "?" : SidText(reinterpret_cast<const TOKEN_OWNER*>(owner.data())->Owner).c_str(),
                              label.empty() ? "?" : SidText(reinterpret_cast<const TOKEN_MANDATORY_LABEL*>(label.data())->Label.Sid).c_str(),
-                             IsTokenRestricted(token) ? 1 : 0, restrictedSids.empty() ? "none" : restrictedSids.c_str());
+                             IsTokenRestricted(token) ? 1 : 0);
+    if (!groups.empty()) {
+        const auto* list = reinterpret_cast<const TOKEN_GROUPS*>(groups.data());
+        std::string line;
+        for (DWORD i = 0; i < list->GroupCount; ++i) {
+            char attributes[16];
+            snprintf(attributes, sizeof(attributes), ":%lX", static_cast<unsigned long>(list->Groups[i].Attributes));
+            std::string item = SidText(list->Groups[i].Sid) + attributes;
+            if (line.size() + item.size() + 1 > 150) {
+                driver->trace.events.Add("pipe: host token groups %s", line.c_str());
+                line.clear();
+            }
+            line += (line.empty() ? "" : ",") + item;
+        }
+        if (!line.empty()) {
+            driver->trace.events.Add("pipe: host token groups %s", line.c_str());
+        }
+    }
     CloseHandle(token);
+}
+
+// The pipe's DACL as SDDL, the allowed account's SID written <allowed> (the log names no account).
+std::string DaclText(HANDLE pipe, const std::wstring& allowedSid) {
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    const DWORD got = GetSecurityInfo(pipe, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, nullptr, nullptr, &descriptor);
+    if (got != ERROR_SUCCESS) {
+        return "unreadable (error " + std::to_string(got) + ")";
+    }
+    LPWSTR text = nullptr;
+    std::wstring sddl;
+    if (ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor, SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &text, nullptr)) {
+        sddl = text;
+        LocalFree(text);
+    }
+    LocalFree(descriptor);
+    if (!allowedSid.empty()) {
+        for (size_t at = sddl.find(allowedSid); at != std::wstring::npos; at = sddl.find(allowedSid)) {
+            sddl.replace(at, allowedSid.size(), L"<allowed>");
+        }
+    }
+    return Narrow(sddl);
 }
 
 }  // namespace
 
-ControlPipe::ControlPipe(Driver* driver, const std::wstring& allowedSid) : m_Driver(driver) {
-    // Protected (no inherited entries): SYSTEM, and that account when one is named. The pipe's owner
-    // (the account the driver's host runs as: LocalService, S-1-5-19, logged by the driver) gets
-    // read and write through OWNER RIGHTS: every instance after the first opens the pipe with its
-    // open mode's access (duplex: read and write, which includes FILE_CREATE_PIPE_INSTANCE), and
-    // without it the next instance is refused (error 5; CI run 43701497363, with 0x4 alone). Other
-    // services running as LocalService match this entry too: system components, not the programs
-    // of the person signed in, which this pipe keeps out.
-    m_Sddl = L"D:P(A;;GA;;;SY)(A;;GRGW;;;OW)";
-    if (!allowedSid.empty()) {
-        m_Sddl += L"(A;;GRGW;;;" + allowedSid + L")";
-    }
-    m_Listener = std::thread([this] { Listen(); });
+ControlPipe::ControlPipe(Driver* driver, const std::wstring& allowedSid) : m_Driver(driver), m_AllowedSid(allowedSid) {
+    m_StopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    m_Listener = std::thread([this] { Start(); });
 }
 
 ControlPipe::~ControlPipe() {
     m_Stop = true;
-    // Unblock ConnectNamedPipe with a connection of our own.
-    HANDLE wake = CreateFileW(PIPE_NAME, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (wake != INVALID_HANDLE_VALUE) {
-        CloseHandle(wake);
-    }
+    SetEvent(m_StopEvent);  // wakes every instance waiting for a client, and every watchdog wait
     if (m_Listener.joinable()) {
         m_Listener.join();
     }
     std::lock_guard<std::mutex> lock(m_Lock);
-    for (auto& t : m_Connections) {
+    for (auto& t : m_Instances) {
         if (t.joinable()) {
             t.join();
         }
     }
+    CloseHandle(m_StopEvent);
 }
 
-void ControlPipe::Listen() {
-    PSECURITY_DESCRIPTOR descriptor = nullptr;
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(m_Sddl.c_str(), SDDL_REVISION_1, &descriptor, nullptr)) {
+void ControlPipe::Start() {
+    // The final DACL, protected (no inherited entries): SYSTEM, and the allowed account when one is
+    // named. The startup one adds the pipe's owner (OWNER RIGHTS: the host's account) for as long as
+    // the pool is being made.
+    std::wstring closedDacl = L"D:P(A;;GA;;;SY)";
+    if (!m_AllowedSid.empty()) {
+        closedDacl += L"(A;;GRGW;;;" + m_AllowedSid + L")";
+    }
+    const std::wstring startup = closedDacl + L"(A;;GRGWWD;;;OW)";
+    PSECURITY_DESCRIPTOR startupDescriptor = nullptr, finalDescriptor = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(startup.c_str(), SDDL_REVISION_1, &startupDescriptor, nullptr) ||
+        !ConvertStringSecurityDescriptorToSecurityDescriptorW(closedDacl.c_str(), SDDL_REVISION_1, &finalDescriptor, nullptr)) {
         m_Driver->trace.events.Add("pipe: its security descriptor was refused (error %lu): no pipe", GetLastError());
+        LocalFree(startupDescriptor);
         return;  // no pipe rather than one open to anyone
     }
-    SECURITY_ATTRIBUTES security = {sizeof(security), descriptor, FALSE};
     LogHostToken(m_Driver);
-    // The first instance is made with FILE_FLAG_FIRST_PIPE_INSTANCE: if another program already made a pipe of this name (to
-    // receive the agent's commands, or answer them), creation fails instead of joining its pipe. From then on this listener
-    // always holds an instance (the next one is made before the connected one is handed over), so the name never becomes free
-    // for anyone else between two connections, and the later instances need not, and cannot, use the flag.
-    auto create = [&](bool first) {
-        return CreateNamedPipeW(PIPE_NAME, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | (first ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0),
-                                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, PIPE_UNLIMITED_INSTANCES,
-                                static_cast<DWORD>(MAX_MESSAGE), static_cast<DWORD>(MAX_MESSAGE), 0, &security);
-    };
-    HANDLE pipe = INVALID_HANDLE_VALUE;
+    SECURITY_ATTRIBUTES security = {sizeof(security), startupDescriptor, FALSE};
+    const DWORD pipeMode = PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
+    std::vector<HANDLE> pool;
     bool told = false;
-    while (!m_Stop && (pipe = create(true)) == INVALID_HANDLE_VALUE) {
+    while (!m_Stop) {
+        // (No instance limit: the pool is fixed by the driver; a further instance can only be
+        // refused by the DACL, which is what the check below shows.)
+        HANDLE first = CreateNamedPipeW(PIPE_NAME, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE | WRITE_DAC, pipeMode,
+                                        PIPE_UNLIMITED_INSTANCES, static_cast<DWORD>(MAX_MESSAGE), static_cast<DWORD>(MAX_MESSAGE), 0, &security);
+        if (first != INVALID_HANDLE_VALUE) {
+            pool.push_back(first);
+            break;
+        }
         if (!told) {
             told = true;
             m_Driver->trace.events.Add("pipe: the first instance cannot be made (error %lu): the name is taken, or creation failed; trying every second",
                                        GetLastError());
         }
-        Sleep(1000);  // the name is taken (or creation failed): never join another program's pipe
+        WaitForSingleObject(m_StopEvent, 1000);  // never joining another program's pipe
     }
-    if (pipe != INVALID_HANDLE_VALUE) {
-        m_Driver->trace.events.Add("pipe: listening (first instance)");
+    DWORD refused = 0;
+    while (!m_Stop && !pool.empty() && pool.size() < PIPE_INSTANCES) {
+        HANDLE next = CreateNamedPipeW(PIPE_NAME, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED, pipeMode, PIPE_UNLIMITED_INSTANCES,
+                                       static_cast<DWORD>(MAX_MESSAGE), static_cast<DWORD>(MAX_MESSAGE), 0, &security);
+        if (next == INVALID_HANDLE_VALUE) {
+            refused = GetLastError();
+            break;
+        }
+        pool.push_back(next);
     }
+    if (!pool.empty()) {
+        m_Driver->trace.events.Add("pipe: %u instances made of %u (error %lu)", static_cast<unsigned>(pool.size()), static_cast<unsigned>(PIPE_INSTANCES), refused);
+        // The final DACL, on the pipe its instances share.
+        BOOL present = FALSE, defaulted = FALSE;
+        PACL dacl = nullptr;
+        DWORD set = ERROR_INVALID_SECURITY_DESCR;
+        if (GetSecurityDescriptorDacl(finalDescriptor, &present, &dacl, &defaulted) && present) {
+            set = SetSecurityInfo(pool[0], SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, nullptr, nullptr, dacl, nullptr);
+        }
+        m_Driver->trace.events.Add("pipe: final DACL set (error %lu), read back %s", set, DaclText(pool.back(), m_AllowedSid).c_str());
+        // One more instance must be refused now: the host's account no longer may make one.
+        HANDLE more = CreateNamedPipeW(PIPE_NAME, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED, pipeMode, PIPE_UNLIMITED_INSTANCES,
+                                       static_cast<DWORD>(MAX_MESSAGE), static_cast<DWORD>(MAX_MESSAGE), 0, &security);
+        const DWORD moreError = more == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+        if (more != INVALID_HANDLE_VALUE) {
+            CloseHandle(more);
+        }
+        m_Driver->trace.events.Add(more == INVALID_HANDLE_VALUE ? "pipe: a further instance is refused now (error %lu)"
+                                                                 : "pipe: UNEXPECTED: a further instance was made after the final DACL (%lu)",
+                                   moreError);
+        if (set != ERROR_SUCCESS) {
+            // Fail closed: no pipe rather than one the host's account may still join.
+            for (HANDLE h : pool) {
+                CloseHandle(h);
+            }
+            pool.clear();
+            m_Driver->trace.events.Add("pipe: closed, its DACL could not be set");
+        }
+    }
+    LocalFree(startupDescriptor);
+    LocalFree(finalDescriptor);
+    if (!pool.empty()) {
+        m_Driver->trace.events.Add("pipe: listening on %u instances", static_cast<unsigned>(pool.size()));
+    }
+    std::lock_guard<std::mutex> lock(m_Lock);
+    for (HANDLE h : pool) {
+        m_Instances.emplace_back([this, h] { Instance(h); });
+    }
+}
+
+void ControlPipe::Instance(HANDLE pipe) {
     while (!m_Stop) {
         OVERLAPPED connect = {};
         connect.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         BOOL connected = ConnectNamedPipe(pipe, &connect);
-        DWORD error = GetLastError();
+        const DWORD error = GetLastError();
+        DWORD ignored = 0;
         if (!connected && error == ERROR_IO_PENDING) {
-            DWORD ignored = 0;
-            connected = GetOverlappedResult(pipe, &connect, &ignored, TRUE);
+            HANDLE events[] = {connect.hEvent, m_StopEvent};
+            if (WaitForMultipleObjects(ARRAYSIZE(events), events, FALSE, INFINITE) == WAIT_OBJECT_0) {
+                connected = GetOverlappedResult(pipe, &connect, &ignored, FALSE);
+            } else {
+                CancelIo(pipe);
+                GetOverlappedResult(pipe, &connect, &ignored, TRUE);  // the cancelled wait done before its OVERLAPPED goes
+                connected = FALSE;
+            }
         } else if (!connected && error == ERROR_PIPE_CONNECTED) {
             connected = TRUE;
         }
@@ -156,34 +255,14 @@ void ControlPipe::Listen() {
         if (m_Stop) {
             break;
         }
-        if (!connected) {
-            DisconnectNamedPipe(pipe);  // the same instance waits again: the name stays ours
-            continue;
+        if (connected) {
+            Serve(pipe, m_NextConnection++);
+        } else {
+            DisconnectNamedPipe(pipe);  // the same instance waits again: the name stays the driver's
         }
-        // The next instance first, while the connected one still holds the name.
-        HANDLE next = create(false);
-        const DWORD nextError = next == INVALID_HANDLE_VALUE ? GetLastError() : 0;
-        // The connection is served whatever happened: a client is never left without an answer.
-        uint32_t connection = m_NextConnection++;
-        {
-            std::lock_guard<std::mutex> lock(m_Lock);
-            m_Connections.emplace_back([this, pipe, connection] { Serve(pipe, connection); });
-        }
-        if (next == INVALID_HANDLE_VALUE) {
-            // Not made (it should be: see the security descriptor). Then a first instance again, once
-            // the connections served have closed theirs: never another program's pipe.
-            m_Driver->trace.events.Add("pipe: the next instance cannot be made (error %lu); a first instance again once the connections close",
-                                       nextError);
-            while (!m_Stop && (next = create(true)) == INVALID_HANDLE_VALUE) {
-                Sleep(250);
-            }
-        }
-        pipe = next;
     }
-    if (pipe != INVALID_HANDLE_VALUE) {
-        CloseHandle(pipe);
-    }
-    LocalFree(descriptor);
+    DisconnectNamedPipe(pipe);
+    CloseHandle(pipe);
 }
 
 void ControlPipe::Serve(HANDLE pipe, uint32_t connection) {
@@ -198,10 +277,12 @@ void ControlPipe::Serve(HANDLE pipe, uint32_t connection) {
         BOOL done = ReadFile(pipe, buffer, static_cast<DWORD>(MAX_MESSAGE), &got, &read);
         if (!done && GetLastError() == ERROR_IO_PENDING) {
             // The watchdog: a connection silent for WATCHDOG_MS is treated as gone.
-            DWORD wait = WaitForSingleObject(read.hEvent, WATCHDOG_MS);
+            HANDLE events[] = {read.hEvent, m_StopEvent};
+            const DWORD wait = WaitForMultipleObjects(ARRAYSIZE(events), events, FALSE, WATCHDOG_MS);
             if (wait != WAIT_OBJECT_0) {
                 CancelIo(pipe);
-                ended = "silent for the watchdog's delay";
+                GetOverlappedResult(pipe, &read, &got, TRUE);  // the cancelled read done before the instance is reused
+                ended = wait == WAIT_TIMEOUT ? "silent for the watchdog's delay" : "the driver stops";
                 break;
             }
             done = GetOverlappedResult(pipe, &read, &got, FALSE);
@@ -249,8 +330,7 @@ void ControlPipe::Serve(HANDLE pipe, uint32_t connection) {
     }
     CloseHandle(read.hEvent);
     m_Driver->trace.events.Add("pipe: connection %u ended (%s)", static_cast<unsigned>(connection), ended);
-    // Whatever this connection made goes with it.
+    // Whatever this connection made goes with it; the instance waits for the next client.
     m_Driver->RemoveConnection(connection);
     DisconnectNamedPipe(pipe);
-    CloseHandle(pipe);
 }
