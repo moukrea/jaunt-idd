@@ -12,10 +12,11 @@
 // connected again), so the name is never free and no instance is ever made later. Windows checks the
 // pipe's DACL each time an instance after the first is made (the open mode's read and write), and the
 // driver's host runs as LocalService, which the final DACL does not name: so the pool is made under a
-// startup DACL that also grants the pipe's owner (OWNER RIGHTS) read, write and WRITE_DAC, then the
-// DACL is replaced by the final one (SYSTEM and the allowed account), and one more instance is tried
-// and must be refused (logged). Any service running as LocalService could make an instance only in
-// that moment of the driver's start; none can afterwards.
+// startup DACL that also grants the host process's own logon SID (its token's TokenLogonSid, which
+// no other process has) read, write and WRITE_DAC, then the DACL is replaced by the final one (SYSTEM
+// and the allowed account), and one more instance is tried and must be refused (logged). Only if
+// Windows refuses the instances under the logon SID is OWNER RIGHTS (LocalService) tried, and the log
+// says which one made the pool. No other principal can make an instance, ever.
 // SPDX-License-Identifier: MIT
 #include "driver.h"
 #include "protocol.h"
@@ -101,6 +102,31 @@ void LogHostToken(Driver* driver) {
     CloseHandle(token);
 }
 
+// The host process's logon SID (S-1-5-5-x-y, or S-1-5-84-... for a user-mode driver host) as text:
+// its token's TokenLogonSid. Empty when it has none or cannot be read.
+std::wstring HostLogonSid() {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        return L"";
+    }
+    DWORD size = 0;
+    GetTokenInformation(token, TokenLogonSid, nullptr, 0, &size);
+    std::wstring out;
+    if (size > 0 && size <= 65536) {
+        std::vector<BYTE> data(size);
+        if (GetTokenInformation(token, TokenLogonSid, data.data(), size, &size)) {
+            const auto* groups = reinterpret_cast<const TOKEN_GROUPS*>(data.data());
+            LPWSTR text = nullptr;
+            if (groups->GroupCount == 1 && ConvertSidToStringSidW(groups->Groups[0].Sid, &text)) {
+                out = text;
+                LocalFree(text);
+            }
+        }
+    }
+    CloseHandle(token);
+    return out;
+}
+
 // The pipe's DACL as SDDL, the allowed account's SID written <allowed> (the log names no account).
 std::string DaclText(HANDLE pipe, const std::wstring& allowedSid) {
     PSECURITY_DESCRIPTOR descriptor = nullptr;
@@ -153,44 +179,78 @@ void ControlPipe::Start() {
     if (!m_AllowedSid.empty()) {
         closedDacl += L"(A;;GRGW;;;" + m_AllowedSid + L")";
     }
-    const std::wstring startup = closedDacl + L"(A;;GRGWWD;;;OW)";
     PSECURITY_DESCRIPTOR startupDescriptor = nullptr, finalDescriptor = nullptr;
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(startup.c_str(), SDDL_REVISION_1, &startupDescriptor, nullptr) ||
-        !ConvertStringSecurityDescriptorToSecurityDescriptorW(closedDacl.c_str(), SDDL_REVISION_1, &finalDescriptor, nullptr)) {
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(closedDacl.c_str(), SDDL_REVISION_1, &finalDescriptor, nullptr)) {
         m_Driver->trace.events.Add("pipe: its security descriptor was refused (error %lu): no pipe", GetLastError());
-        LocalFree(startupDescriptor);
         return;  // no pipe rather than one open to anyone
     }
     LogHostToken(m_Driver);
-    SECURITY_ATTRIBUTES security = {sizeof(security), startupDescriptor, FALSE};
+    // Who may make the pool's instances while it is made, narrowest first: the driver host's own
+    // logon session (its token's logon SID, held by this host process alone: the other services
+    // running as LocalService have their own), then, only if Windows refuses that, OWNER RIGHTS (the
+    // host's account, LocalService). The log says which one made the pool.
+    struct Principal {
+        const char* name;
+        std::wstring sid;
+    };
+    std::vector<Principal> principals;
+    const std::wstring logon = HostLogonSid();
+    if (!logon.empty()) {
+        principals.push_back({"the host's logon SID", logon});
+    }
+    principals.push_back({"OWNER RIGHTS (fallback: LocalService)", L"OW"});
+    SECURITY_ATTRIBUTES security = {sizeof(security), nullptr, FALSE};
     const DWORD pipeMode = PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
     std::vector<HANDLE> pool;
-    bool told = false;
-    while (!m_Stop) {
-        // (No instance limit: the pool is fixed by the driver; a further instance can only be
-        // refused by the DACL, which is what the check below shows.)
-        HANDLE first = CreateNamedPipeW(PIPE_NAME, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE | WRITE_DAC, pipeMode,
-                                        PIPE_UNLIMITED_INSTANCES, static_cast<DWORD>(MAX_MESSAGE), static_cast<DWORD>(MAX_MESSAGE), 0, &security);
-        if (first != INVALID_HANDLE_VALUE) {
-            pool.push_back(first);
-            break;
-        }
-        if (!told) {
-            told = true;
-            m_Driver->trace.events.Add("pipe: the first instance cannot be made (error %lu): the name is taken, or creation failed; trying every second",
-                                       GetLastError());
-        }
-        WaitForSingleObject(m_StopEvent, 1000);  // never joining another program's pipe
-    }
     DWORD refused = 0;
-    while (!m_Stop && !pool.empty() && pool.size() < PIPE_INSTANCES) {
-        HANDLE next = CreateNamedPipeW(PIPE_NAME, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED, pipeMode, PIPE_UNLIMITED_INSTANCES,
-                                       static_cast<DWORD>(MAX_MESSAGE), static_cast<DWORD>(MAX_MESSAGE), 0, &security);
-        if (next == INVALID_HANDLE_VALUE) {
-            refused = GetLastError();
+    for (size_t p = 0; p < principals.size() && !m_Stop; ++p) {
+        LocalFree(startupDescriptor);
+        startupDescriptor = nullptr;
+        const std::wstring startup = closedDacl + L"(A;;GRGWWD;;;" + principals[p].sid + L")";
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(startup.c_str(), SDDL_REVISION_1, &startupDescriptor, nullptr)) {
+            m_Driver->trace.events.Add("pipe: the startup descriptor for %s was refused (error %lu)", principals[p].name, GetLastError());
+            continue;
+        }
+        security.lpSecurityDescriptor = startupDescriptor;
+        const bool last = p + 1 == principals.size();
+        bool told = false;
+        while (!m_Stop) {
+            // (No instance limit: the pool is fixed by the driver; a further instance can only be
+            // refused by the DACL, which is what the check below shows.)
+            HANDLE first = CreateNamedPipeW(PIPE_NAME, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE | WRITE_DAC, pipeMode,
+                                            PIPE_UNLIMITED_INSTANCES, static_cast<DWORD>(MAX_MESSAGE), static_cast<DWORD>(MAX_MESSAGE), 0, &security);
+            if (first != INVALID_HANDLE_VALUE) {
+                pool.push_back(first);
+                break;
+            }
+            if (!told) {
+                told = true;
+                m_Driver->trace.events.Add("pipe: the first instance cannot be made (error %lu): the name is taken, or creation failed; trying every second",
+                                           GetLastError());
+            }
+            WaitForSingleObject(m_StopEvent, 1000);  // never joining another program's pipe
+        }
+        refused = 0;
+        while (!m_Stop && !pool.empty() && pool.size() < PIPE_INSTANCES) {
+            HANDLE next = CreateNamedPipeW(PIPE_NAME, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED, pipeMode, PIPE_UNLIMITED_INSTANCES,
+                                           static_cast<DWORD>(MAX_MESSAGE), static_cast<DWORD>(MAX_MESSAGE), 0, &security);
+            if (next == INVALID_HANDLE_VALUE) {
+                refused = GetLastError();
+                break;
+            }
+            pool.push_back(next);
+        }
+        if (pool.size() == PIPE_INSTANCES || last) {
+            m_Driver->trace.events.Add("pipe: startup principal %s", principals[p].name);
             break;
         }
-        pool.push_back(next);
+        // Windows refused this principal's instances (error `refused`): all closed, the next one tried.
+        m_Driver->trace.events.Add("pipe: %u of %u instances made under %s (error %lu): trying the next principal", static_cast<unsigned>(pool.size()),
+                                   static_cast<unsigned>(PIPE_INSTANCES), principals[p].name, refused);
+        for (HANDLE h : pool) {
+            CloseHandle(h);
+        }
+        pool.clear();
     }
     if (!pool.empty()) {
         m_Driver->trace.events.Add("pipe: %u instances made of %u (error %lu)", static_cast<unsigned>(pool.size()), static_cast<unsigned>(PIPE_INSTANCES), refused);

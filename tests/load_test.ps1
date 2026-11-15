@@ -537,15 +537,69 @@ try {
         $expected = @("Allow S-1-5-18", "Allow $me")
         $pipeLog = @(DriverLog $pipe | Where-Object { $_ -match "pipe: " })
         $refusedNow = @($pipeLog | Where-Object { $_ -match "a further instance is refused now \(error 5\)" })
-        $unexpected = @($pipeLog | Where-Object { $_ -match "UNEXPECTED|cannot be made|could not be set" })
-        Step "the pipe's DACL: SYSTEM and the allowed account only; the driver's account refused a further instance" `
-            (($principals -join ",") -eq (($expected | Sort-Object) -join ",") -and $refusedNow.Count -eq 1 -and -not $unexpected.Count) `
+        $unexpected = @($pipeLog | Where-Object { $_ -match "UNEXPECTED|cannot be made|could not be set|trying the next principal" })
+        $startupWho = @($pipeLog | Where-Object { $_ -match "startup principal" })
+        Step "the pipe's DACL: SYSTEM and the allowed account only; the pool made under the host's own logon SID; a further instance refused" `
+            (($principals -join ",") -eq (($expected | Sort-Object) -join ",") -and $refusedNow.Count -eq 1 -and -not $unexpected.Count -and ($startupWho -join "") -match "the host's logon SID") `
             ([ordered]@{ dacl = $(if ($dacl) { $dacl.Replace($me, "<allowed>") } else { $null }); principals = @($principals | ForEach-Object { if ($_ -eq $me) { "<allowed>" } else { $_ } }); pipeLog = @($pipeLog | ForEach-Object { $_.Replace($me, "<allowed>") }) })
+        # Other principals refused: a service running as LocalService (the driver's own account, so
+        # what a looser DACL would have let in), another administrator-less local user, and this
+        # account's own other-session programs are the same as it, so not tested. Each runs a snippet
+        # that tries to open the pipe and says what happened. A principal that cannot be set up here
+        # is said so (not tested), not counted as refused.
+        $probeCode = @'
+try {
+    $p = New-Object IO.Pipes.NamedPipeClientStream(".", "jaunt-idd", [IO.Pipes.PipeDirection]::InOut)
+    $p.Connect(3000)
+    "OPENED"
+    $p.Dispose()
+} catch [UnauthorizedAccessException] { "REFUSED access denied" }
+catch { "OTHER " + $_.Exception.GetType().Name + ": " + $_.Exception.Message }
+'@
+        $probes = [ordered]@{}
+        $probeDir = "C:\jaunt-idd-probe"
+        try {
+            New-Item -ItemType Directory -Force $probeDir | Out-Null
+            $null = & icacls.exe $probeDir /grant "*S-1-1-0:(OI)(CI)M" 2>&1
+            Set-Content -Path (Join-Path $probeDir "probe.ps1") -Value $probeCode -Encoding UTF8
+            # LocalService, by a scheduled task.
+            try {
+                $task = "jaunt-idd-probe-ls"
+                $out = Join-Path $probeDir "ls.out"
+                $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command `"& '$probeDir\probe.ps1' | Set-Content -Path '$out' -Encoding ASCII`""
+                $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\LOCAL SERVICE" -LogonType ServiceAccount
+                Register-ScheduledTask -TaskName $task -Action $action -Principal $principal -Force | Out-Null
+                Start-ScheduledTask -TaskName $task
+                $got = WaitFor { if (Test-Path $out) { [string](Get-Content -Raw $out) } } 40
+                $probes.localService = if ($got) { $got.Trim() } else { "NOT TESTED: no answer from the task" }
+            } catch { $probes.localService = "NOT TESTED: $($_.Exception.Message)" }
+            finally { Unregister-ScheduledTask -TaskName "jaunt-idd-probe-ls" -Confirm:$false -ErrorAction SilentlyContinue }
+            # Another local standard user.
+            $probeUser = "jaunt-idd-probe"
+            try {
+                $secret = [guid]::NewGuid().ToString("N") + "aA1!"
+                New-LocalUser -Name $probeUser -Password (ConvertTo-SecureString $secret -AsPlainText -Force) -AccountNeverExpires -PasswordNeverExpires | Out-Null
+                $credential = New-Object Management.Automation.PSCredential($probeUser, (ConvertTo-SecureString $secret -AsPlainText -Force))
+                $out = Join-Path $probeDir "user.out"
+                $process = Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$probeDir\probe.ps1`"" `
+                    -Credential $credential -WorkingDirectory $probeDir -RedirectStandardOutput $out -PassThru -WindowStyle Hidden -ErrorAction Stop
+                $null = $process.Handle
+                if ($process.WaitForExit(40000)) { $probes.otherUser = ([string](Get-Content -Raw $out -ErrorAction SilentlyContinue)).Trim() } else { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue; $probes.otherUser = "NOT TESTED: no answer in 40 s" }
+            } catch { $probes.otherUser = "NOT TESTED: $($_.Exception.Message)" }
+            finally { Remove-LocalUser -Name $probeUser -ErrorAction SilentlyContinue }
+        } catch { $probes.setup = "NOT TESTED: $($_.Exception.Message)" }
+        finally { Remove-Item -Recurse -Force $probeDir -ErrorAction SilentlyContinue }
+        $notRefused = @($probes.Keys | Where-Object { $probes[$_] -notmatch "^REFUSED" -and $probes[$_] -notmatch "^NOT TESTED" })
+        $tested = @($probes.Keys | Where-Object { $probes[$_] -match "^REFUSED" })
+        Step "a LocalService service and another local user are refused the pipe (what could be set up here)" ($notRefused.Count -eq 0 -and $tested.Count -ge 1) ([ordered]@{ probes = $probes })
         # Ten connections at once (a monitor each, and more): all served, from the pool of instances
         # the driver made at its start. (The first connection is pinged just before, and the others are
         # opened within 2 s each: the watchdog, 5 s, closes none meanwhile.)
         $others = @()
         $answers = @()
+        # (The probes above took longer than the watchdog's 5 s: a connection of its own, new.)
+        $pipe.Dispose()
+        $pipe = Connect
         try {
             $null = Ask $pipe "ping"
             foreach ($n in 1..9) { $others += Connect 2000 }
