@@ -11,8 +11,12 @@ Driver (NOTICE.md).
 - Windows 10 version 1903 (build 18362) or later, x64 or ARM64: IddCx 1.4, UMDF 2.25.
 - No monitor until a program asks for one. The driver listens on a named pipe,
   `\\.\pipe\jaunt-idd`, and adds a monitor of the mode it is given (320 to 8192 pixels a side, 24
-  to 240 Hz), without an EDID: Windows takes the driver's mode list, so any size works. Up to 8
-  monitors at once, one per connector of the adapter; a monitor that goes frees its connector.
+  to 240 Hz). Each monitor announces a synthetic EDID (`src/edid.cpp`: 128 bytes, the name "jaunt",
+  a serial of its own, one detailed timing, the requested mode, with the blanking and pixel clock
+  that give exactly its refresh rate), and the driver's mode and target mode lists are the EDID's
+  own. A detailed timing holds 4095 pixels a side at most: a larger mode is described by the
+  nearest one a timing holds, and stays the monitor's preferred mode. Up to 8 monitors at once, one
+  per connector of the adapter; a monitor that goes frees its connector.
 - **Who may ask:** the pipe's security descriptor lets SYSTEM and one account open it, the one named
   at installation (`AllowedUser`, a SID, in the device's hardware key). No one else: not Everyone,
   not Administrators, not remote clients (`PIPE_REJECT_REMOTE_CLIENTS`). Without that value, SYSTEM
@@ -99,7 +103,8 @@ One request per pipe message, one answer each (UTF-8 text):
 | `add <width> <height> <refresh>` | `ok <id>` |
 | `remove <id>` | `ok` |
 | `ping` | `pong` |
-| `status` | `ok adapter=0x… monitors=… modes=… targets=… commits=… paths=… active=… swapchains=… render=… device=0x… setdevice=0x… frames=… unassigned=… dxgi=…` |
+| `status` | `ok adapter=0x… monitors=… modes=… targets=… commits=… paths=… active=… swapchains=… render=… device=0x… setdevice=0x… frames=… unassigned=… edids=… arrivals=… os=<LUID>/<target> dxgi=…` |
+| `log [<from>]` | `ok next=<n> first=<n>`, then the driver's log lines from line `<from>` (the oldest kept by default), one per line; ask again from `next=` for the rest |
 
 Anything else, or a value out of range: `error <why>`. A ninth monitor at once: `error no free
 connector`. When Windows refuses a call, the error ends with its NTSTATUS, e.g. `error
@@ -107,8 +112,15 @@ IddCxMonitorArrival failed (0xC0000001)`. `status` says what Windows asked of th
 it asked for monitor and target modes, committed modes (with how many paths, how many active)
 and assigned swap chains, the render adapter of the last one, the results of making its D3D
 device and handing it over (`0x8000000A`: not yet), the frames received, and the render adapters
-DXGI listed to the driver (`vendor:device:flags:LUID`). `src/protocol.cpp`, tested on its own by
-`tests/protocol_test.cpp` (any C++17 compiler).
+DXGI listed to the driver (`vendor:device:flags:LUID`), and where Windows exposed the last monitor
+that arrived (`os=`: the adapter's LUID and the target id, what a companion program needs to find
+that display). `log` returns the driver's bounded log (`src/log.cpp`: the newest 600 lines, text
+only, no secrets): every callback Windows made (adapter initialisation, EDID parse, mode queries,
+committed modes with each path's flags and size, swap chain assignment and release) and the result
+of every Windows call the driver made (monitor create, arrival with the LUID and target id,
+departure, the swap chain's device), so that a monitor that does not become a display can be
+diagnosed from the log alone. `src/protocol.cpp`, `src/edid.cpp` and `src/log.cpp` are tested on
+their own by `tests/protocol_test.cpp` and `tests/edid_test.cpp` (any C++17 compiler).
 
 ## Build
 
@@ -134,9 +146,12 @@ Until this repository's signing is set up, a release is published unsigned, as a
 
 CI builds the driver, runs the protocol tests and checks the install scripts. GitHub's Windows
 runner boots in test-signing mode, so CI also signs the build with a throwaway test certificate
-made in the job, installs it, adds and removes a monitor, checks that a silent or closed connection
-loses its monitors, uninstalls it and removes the certificate (`tests/load_test.ps1`, which runs on
-GitHub's hosted runners only; reported for now). On a test computer (a virtual machine with
+made in the job, installs it, adds a monitor and checks that it becomes an active display of the
+size asked (an active path on the driver's adapter in QueryDisplayConfig, by itself or once the
+desktop is extended to it) and that removing it brings the display topology back, checks that a
+silent or closed connection loses its monitors, uninstalls it and removes the certificate
+(`tests/load_test.ps1`, which runs on GitHub's hosted runners only; a failing step fails the job;
+the driver's log is in the job's artifact, `out/load-driver.log`). On a test computer (a virtual machine with
 `bcdedit /set testsigning on` set by hand, the build signed with a test certificate it trusts):
 
 1. `install.ps1 -TestSigning`; `Get-PnpDevice -FriendlyName "jaunt virtual display"` shows it

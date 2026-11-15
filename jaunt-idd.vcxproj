@@ -73,10 +73,14 @@
     <ClCompile Include="src\driver.cpp" />
     <ClCompile Include="src\control.cpp" />
     <ClCompile Include="src\protocol.cpp" />
+    <ClCompile Include="src\edid.cpp" />
+    <ClCompile Include="src\log.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\driver.h" />
     <ClInclude Include="src\protocol.h" />
+    <ClInclude Include="src\edid.h" />
+    <ClInclude Include="src\log.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="src\jaunt-idd.rc" />

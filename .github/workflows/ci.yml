@@ -1,7 +1,8 @@
 # Build jaunt's indirect display driver for x64 and ARM64 on every push and pull request, test its
 # control protocol, check the install scripts (tests/scripts_test.ps1), make the catalog again as a
-# release does after signing (catalog.ps1), and, on x64, load and use the driver signed with a
-# throwaway test certificate (tests/load_test.ps1; GitHub's runner boots in test-signing mode).
+# release does after signing (catalog.ps1), and, on x64, install the unsigned package as a person
+# does and use it: a monitor must become an active display (tests/load_test.ps1; GitHub's runner
+# boots in test-signing mode). A failing step fails the job.
 # SPDX-License-Identifier: MIT
 name: ci
 on:
@@ -43,12 +44,14 @@ jobs:
         run: |
           Copy-Item -Recurse "out/$env:PLATFORM/package/driver" catalog-check
           ./catalog.ps1 -Driver catalog-check -Platform $env:PLATFORM
-      # Reported, not failing the job yet: GitHub's runner boots in test-signing mode, so the package,
-      # signed with a test certificate made in this job and removed after, can be installed, used
-      # (a monitor added and removed, the watchdog) and uninstalled (tests/load_test.ps1).
-      - name: The driver loaded and used, with a throwaway test certificate (reported)
+      # Blocking: GitHub's runner boots in test-signing mode, so the package, installed as an unsigned
+      # release is (install.ps1 -SignLocally, a certificate made in this job and removed after), can
+      # be installed, used (a monitor added that must become an active display of its size, then
+      # removed with the topology back; the watchdog) and uninstalled (tests/load_test.ps1). The
+      # driver's own log and the steps' details are in the job's artifact (out/load-driver.log,
+      # out/load-test.log).
+      - name: The driver loaded and used, a monitor made an active display
         if: matrix.platform == 'x64'
-        continue-on-error: true
         timeout-minutes: 20
         shell: pwsh
         run: powershell.exe -NoProfile -NonInteractive -InputFormat None -ExecutionPolicy Bypass -File tests/load_test.ps1 -Package out/x64/package

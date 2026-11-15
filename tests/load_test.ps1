@@ -1,9 +1,13 @@
 # Load the driver on GitHub's own Windows runner, use it, and remove it: installs the unsigned package
 # as people install an unsigned release, install.ps1 -SignLocally (a certificate made for this
 # computer signs its catalog, is trusted, and loses its private key), checks that certificate, adds
-# and removes monitors through the pipe, checks that a silent connection and a closed one lose
-# theirs, then runs uninstall.ps1, which removes the certificate too. The runner boots in
-# test-signing mode, so this does not show that the driver loads without it.
+# a monitor through the pipe and checks that it becomes an ACTIVE display of the size asked (an
+# active path on the driver's adapter in QueryDisplayConfig, by itself or once the desktop is
+# extended to it) and that removing it brings the topology back, adds and removes more monitors,
+# checks that a silent connection and a closed one lose theirs, then runs uninstall.ps1, which
+# removes the certificate too. Every step blocks: a step that fails fails the job. The driver's own
+# log (its `log` request) goes into the first monitor's step and, whole, into out\load-driver.log.
+# The runner boots in test-signing mode, so this does not show that the driver loads without it.
 # It runs nowhere else: only where GITHUB_ACTIONS is true and RUNNER_ENVIRONMENT is github-hosted, on
 # a computer already in test-signing mode (this never turns that mode on), as an administrator,
 # with no jaunt-idd installed. The certificate install.ps1 makes loses its private key before the
@@ -12,7 +16,7 @@
 # -Then: a script run with the driver installed, before it is removed (a program that uses the
 # driver checks itself there); its exit code and output are a step.
 # Writes one JSON line: {ran: false, why} where it does not run, else each step; exits 1 when a step
-# failed (CI reports it).
+# failed (the CI job fails with it).
 # SPDX-License-Identifier: MIT
 param([Parameter(Mandatory = $true)][string]$Package, [string]$Then = "")
 $env:PSModulePath = "$PSHOME\Modules;$env:PSModulePath"
@@ -190,6 +194,92 @@ public static class JauntIddDisplays
         return "no target available on another adapter";
     }
 
+    // The size of a path's source, "<width>x<height>", from its mode: QueryDisplayConfig's index into
+    // the modes, packed (clone group in the low 16 bits, source mode in the high 16) when the path
+    // supports virtual modes. "" when it has none.
+    static string SourceSize(PATH p, MODE[] modes)
+    {
+        uint index = p.source.modeInfoIdx;
+        if ((p.flags & 0x8) != 0) index = index >> 16;  // DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE
+        if (index >= modes.Length || modes[index].infoType != 1) return "";  // DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE
+        return (modes[index].a & 0xFFFFFFFF) + "x" + (modes[index].a >> 32);
+    }
+
+    // The size of a path's target signal (its active size), the same way.
+    static string TargetSize(PATH p, MODE[] modes)
+    {
+        uint index = p.target.modeInfoIdx;
+        if ((p.flags & 0x8) != 0) index = index & 0xFFFF;
+        if (index >= modes.Length || modes[index].infoType != 2) return "";  // DISPLAYCONFIG_MODE_INFO_TYPE_TARGET
+        return (modes[index].d & 0xFFFFFFFF) + "x" + (modes[index].d >> 32);
+    }
+
+    // Every active path (QueryDisplayConfig, only the active ones), sorted: "<adapter>/<target>
+    // source <size> target <size>". The topology, to compare before and after.
+    public static string[] Active()
+    {
+        PATH[] paths;
+        MODE[] modes;
+        int result = Query(QDC_ONLY_ACTIVE_PATHS, out paths, out modes);
+        if (result != 0) return new string[] { "QueryDisplayConfig " + result };
+        List<string> found = new List<string>();
+        foreach (PATH p in paths) found.Add(Target(p) + " source " + SourceSize(p, modes) + " target " + TargetSize(p, modes));
+        found.Sort(StringComparer.Ordinal);
+        return found.ToArray();
+    }
+
+    // The active paths whose target is on that adapter (LUID high and low), and, when `size` is not
+    // empty, whose source is that size: the driver's monitor as an active display.
+    public static string[] ActiveOn(uint high, uint low, string size)
+    {
+        PATH[] paths;
+        MODE[] modes;
+        if (Query(QDC_ONLY_ACTIVE_PATHS, out paths, out modes) != 0) return new string[0];
+        List<string> found = new List<string>();
+        foreach (PATH p in paths)
+        {
+            if ((uint)p.target.adapterId.HighPart != high || p.target.adapterId.LowPart != low) continue;
+            string source = SourceSize(p, modes);
+            if (size.Length != 0 && source != size) continue;
+            found.Add(Target(p) + " source " + source + " target " + TargetSize(p, modes));
+        }
+        return found.ToArray();
+    }
+
+    // The active paths plus one to that target (the driver's monitor, where it arrived), from the
+    // first source of its adapter no active path uses, applied as supplied (Windows picks the modes):
+    // what it answers (0: done).
+    public static string AttachTarget(uint high, uint low, uint targetId)
+    {
+        PATH[] all, active;
+        MODE[] allModes, modes;
+        int result = Query(QDC_ALL_PATHS, out all, out allModes);
+        if (result != 0) return "QueryDisplayConfig(all) " + result;
+        result = Query(QDC_ONLY_ACTIVE_PATHS, out active, out modes);
+        if (result != 0) return "QueryDisplayConfig(active) " + result;
+        foreach (PATH p in all)
+        {
+            if ((uint)p.target.adapterId.HighPart != high || p.target.adapterId.LowPart != low || p.target.id != targetId) continue;
+            bool used = false;
+            foreach (PATH a in active)
+            {
+                used = used || (a.source.adapterId.LowPart == p.source.adapterId.LowPart && a.source.adapterId.HighPart == p.source.adapterId.HighPart && a.source.id == p.source.id);
+            }
+            if (used) continue;
+            PATH added = p;
+            added.flags = PATH_ACTIVE;
+            added.source.modeInfoIdx = 0xFFFFFFFF;
+            added.target.modeInfoIdx = 0xFFFFFFFF;
+            PATH[] wanted = new PATH[active.Length + 1];
+            Array.Copy(active, wanted, active.Length);
+            wanted[active.Length] = added;
+            // SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_APPLY | SDC_ALLOW_CHANGES
+            int set = SetDisplayConfigSupplied((uint)wanted.Length, wanted, (uint)modes.Length, modes, 0x20 | 0x80 | 0x400);
+            return "target " + Target(p) + " from source " + p.source.id + ": SetDisplayConfig " + set;
+        }
+        return "no free path to target " + targetId;
+    }
+
     // The desktop extended over every display connected (SDC_TOPOLOGY_EXTEND | SDC_APPLY): what
     // Windows answers (0: done).
     public static int Extend()
@@ -242,6 +332,37 @@ function WaitFor([scriptblock]$waitTest, [int]$waitSeconds) {
 }
 function PipeThere { [bool](@([IO.Directory]::GetFiles("\\.\pipe\")) -contains "\\.\pipe\jaunt-idd") }
 function Shown([string]$size) { @([JauntIddDisplays]::Attached() | Where-Object { $_ -match " $size at " }) }
+# Where Windows exposed the monitor that arrived last, from the driver's `status` (os=<adapter
+# LUID>/<target id>), or $null.
+function OsOf([string]$statusText) {
+    if ($statusText -match ' os=([0-9A-F]{8}):([0-9A-F]{8})/(\d+) ') {
+        [pscustomobject]@{ high = [Convert]::ToUInt32($Matches[1], 16); low = [Convert]::ToUInt32($Matches[2], 16); target = [Convert]::ToUInt32($Matches[3]); text = "$($Matches[1]):$($Matches[2])/$($Matches[3])" }
+    } else { $null }
+}
+# The active displays on the driver's adapter (QueryDisplayConfig), of that size when one is given.
+function ActiveOn($os, [string]$activeSize) {
+    if ($os -and ($os.high -ne 0 -or $os.low -ne 0)) { @([JauntIddDisplays]::ActiveOn($os.high, $os.low, $activeSize)) } else { @() }
+}
+# The driver's log (its `log` request): every line it kept, oldest first, paged by its answers' bound.
+function DriverLog($logPipe) {
+    $lines = @()
+    $from = [uint32]0
+    for ($page = 0; $page -lt 60; $page++) {
+        $rows = @((Ask $logPipe "log $from") -split "`r?`n")
+        if ($rows[0] -notmatch '^ok next=(\d+) first=(\d+)$') { $lines += "unreadable: $($rows[0])"; break }
+        $next = [uint32]$Matches[1]
+        $lines += @($rows | Select-Object -Skip 1 | Where-Object { $_ })
+        if ($next -le $from) { break }
+        $from = $next
+    }
+    return $lines
+}
+# Up: the monitor of that size that arrived last, listed by Windows (an attached display) and active
+# (QueryDisplayConfig, on the driver's adapter).
+function Up($upConnection, [string]$upSize) {
+    $upActive = ActiveOn (OsOf (Ask $upConnection "status")) $upSize
+    if ($upActive.Count -and (Shown $upSize).Count) { $upActive } else { $null }
+}
 function Connect {
     $pipe = New-Object IO.Pipes.NamedPipeClientStream(".", "jaunt-idd", [IO.Pipes.PipeDirection]::InOut)
     $pipe.Connect(5000)
@@ -253,15 +374,15 @@ function Connect {
 function WaitAlive($aliveConnection, [scriptblock]$aliveTest, [int]$aliveSeconds) {
     WaitFor { $null = Ask $aliveConnection "ping"; & $aliveTest } $aliveSeconds
 }
-# A monitor that arrived, listed by Windows: waited for, then once more after extending the desktop
-# over every display (what a monitor plugged in gets on a desktop that does it by itself). What
-# extending answered, if it was needed.
+# A monitor that arrived, up (listed and active): waited for, then once more after extending the
+# desktop over every display (what a monitor plugged in gets on a desktop that does it by itself).
+# What extending answered, if it was needed.
 function Appear($appearConnection, [string]$appearSize) {
-    $seen = WaitAlive $appearConnection { Shown $appearSize } 10
+    $seen = WaitAlive $appearConnection { Up $appearConnection $appearSize } 10
     $extend = $null
     if (-not $seen) {
         $extend = [JauntIddDisplays]::Extend()
-        $seen = WaitAlive $appearConnection { Shown $appearSize } 10
+        $seen = WaitAlive $appearConnection { Up $appearConnection $appearSize } 10
     }
     [ordered]@{ listed = @($seen); extend = $extend }
 }
@@ -333,32 +454,42 @@ try {
     }
 
     if ($pipeThere) {
-        # ---- a monitor added, listed by Windows, removed ----------------------------------------
+        # ---- a monitor added, made an ACTIVE display of its size, removed ------------------------
+        # The goal, not a side effect: QueryDisplayConfig lists an active path on the driver's adapter
+        # whose source is 1170x2532 (and Windows lists an attached display of that size), by itself or
+        # after the desktop is extended to it; removing it brings the topology back as it was.
         $pipe = Connect
+        $topologyBefore = @([JauntIddDisplays]::Active())
         $added = Ask $pipe "add 1170 2532 60"
-        $listed = WaitAlive $pipe { Shown "1170x2532" } 20
-        # Not listed although it arrived: what Windows has, and what extending the desktop does.
+        $os = OsOf (Ask $pipe "status")
+        $active = WaitAlive $pipe { Up $pipe "1170x2532" } 20
+        $how = if ($active) { "by itself" } else { $null }
+        # Not active although it arrived: what Windows has, then our target added to the active paths
+        # (what jaunt's agent can do), then the desktop extended over every display.
         $why = $null
-        if ($added -match '^ok \d+$' -and -not $listed) {
+        if ($added -match '^ok \d+$' -and -not $active) {
             $why = [ordered]@{
                 status = Ask $pipe "status"
                 devices = @([JauntIddDisplays]::All())
                 targets = @([JauntIddDisplays]::Targets())
+                activePaths = @([JauntIddDisplays]::Active())
                 displayAdapters = @(Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | ForEach-Object { "$($_.FriendlyName) $($_.Status)" })
+                monitors = @(Get-PnpDevice -Class Monitor -ErrorAction SilentlyContinue | ForEach-Object { "$($_.FriendlyName) $($_.Status)" })
                 renderDevices = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object FriendlyName -match "Render" | ForEach-Object { "$($_.FriendlyName) $($_.Status)" })
-                # Only our display added to the active ones (what jaunt's agent could do), then, if
-                # still not listed, the desktop extended over every display.
-                attach = [JauntIddDisplays]::AttachIndirect()
+                attach = if ($os) { [JauntIddDisplays]::AttachTarget($os.high, $os.low, $os.target) } else { "no arrival in status" }
             }
-            $listed = WaitAlive $pipe { Shown "1170x2532" } 10
-            $why.listedAfterAttach = [bool]$listed
+            $active = WaitAlive $pipe { Up $pipe "1170x2532" } 10
+            if ($active) { $how = "after its target was added to the active paths" }
+            $why.activeAfterAttach = [bool]$active
             $why.statusAfterAttach = Ask $pipe "status"
-            if (-not $listed) {
+            if (-not $active) {
                 $why.extend = [JauntIddDisplays]::Extend()
-                $listed = WaitAlive $pipe { Shown "1170x2532" } 10
-                $why.listedAfterExtend = [bool]$listed
+                $active = WaitAlive $pipe { Up $pipe "1170x2532" } 10
+                if ($active) { $how = "after the desktop was extended" }
+                $why.activeAfterExtend = [bool]$active
             }
             $why.targetsAfter = @([JauntIddDisplays]::Targets())
+            $why.activePathsAfter = @([JauntIddDisplays]::Active())
             $why.statusAfter = Ask $pipe "status"
             # What the logs said meanwhile: display, desktop window manager and driver framework.
             $logs = @()
@@ -373,11 +504,20 @@ try {
             }
             $why.logs = $logs
         }
+        $statusActive = Ask $pipe "status"
+        $shown = @(Shown "1170x2532")
+        # The topology's size while it is there, then removed.
+        $activeList = @([JauntIddDisplays]::Active())
         $id = if ($added -match '^ok (\d+)$') { $Matches[1] } else { "0" }
         $removed = Ask $pipe "remove $id"
-        $gone = [bool](WaitAlive $pipe { -not (Shown "1170x2532").Count } 20)
-        Step "a 1170x2532 monitor: added, listed, removed" ($added -match '^ok \d+$' -and $listed -and $removed -eq "ok" -and $gone) `
-            ([ordered]@{ add = $added; listed = @($listed); notListed = $why; remove = $removed; gone = $gone })
+        $gone = [bool](WaitAlive $pipe { -not (Shown "1170x2532").Count -and -not (ActiveOn $os "").Count } 20)
+        $restored = [bool](WaitAlive $pipe { (@([JauntIddDisplays]::Active()) -join "`n") -eq ($topologyBefore -join "`n") } 20)
+        $driverLog = @(DriverLog $pipe)
+        Step "a 1170x2532 monitor: added, an active display of its size, removed, the topology back" `
+            ($added -match '^ok \d+$' -and $active -and $shown.Count -and $removed -eq "ok" -and $gone -and $restored) `
+            ([ordered]@{ add = $added; os = $(if ($os) { $os.text } else { $null }); activeOnDriverAdapter = @($active); becameActive = $how; shown = $shown; statusActive = $statusActive
+                         topologyBefore = $topologyBefore; topologyWhileThere = $activeList; notActive = $why
+                         remove = $removed; gone = $gone; topologyRestored = $restored; topologyAfter = @([JauntIddDisplays]::Active()); driverLog = $driverLog })
         $pong = Ask $pipe "ping"
         $refused = Ask $pipe "add 100 100 60"
         Step "ping answered, a size out of range refused" ($pong -eq "pong" -and $refused -like "error *") ([ordered]@{ ping = $pong; add100 = $refused })
@@ -462,6 +602,17 @@ try {
             ([ordered]@{ pipe = $still; status = $answer; add = $addAfter; remove = $removeAfter; devices = $deviceNow; events = $events })
     }
 
+    # ---- the driver's whole log, kept as a file the job uploads (out\load-driver.log) -------------
+    if ($pipeThere) {
+        try {
+            $logPipe = Connect
+            $whole = @(DriverLog $logPipe)
+            $logPipe.Dispose()
+            New-Item -ItemType Directory -Force (Join-Path $root "out") | Out-Null
+            Set-Content -Path (Join-Path $root "out\load-driver.log") -Value $whole -Encoding utf8
+        } catch { }
+    }
+
     # ---- removed ----------------------------------------------------------------------------------
     $code = RunScript (Join-Path $env:ProgramFiles "jaunt-idd\uninstall.ps1") @("-Yes", "-Result", (Join-Path $work "uninstall.json")) 300
     $uninstall = ReadReport (Join-Path $work "uninstall.json")
@@ -490,4 +641,9 @@ try {
 }
 $steps["passed"] = -not $script:failed
 $steps | ConvertTo-Json -Compress -Depth 6
+# The same, readable, for the job's artifact (out\load-test.log).
+try {
+    New-Item -ItemType Directory -Force (Join-Path $root "out") | Out-Null
+    Set-Content -Path (Join-Path $root "out\load-test.log") -Value ($steps | ConvertTo-Json -Depth 8) -Encoding utf8
+} catch { }
 if ($script:failed) { exit 1 }
