@@ -12,6 +12,7 @@
 #include <sddl.h>
 
 #include <string>
+#include <vector>
 
 using namespace jaunt_idd;
 
@@ -25,6 +26,54 @@ std::string Narrow(const std::wstring& text) {
         out.push_back(c < 0x80 ? static_cast<char>(c) : '?');
     }
     return out;
+}
+
+std::string SidText(PSID sid) {
+    LPWSTR text = nullptr;
+    if (sid == nullptr || !ConvertSidToStringSidW(sid, &text)) {
+        return "?";
+    }
+    std::string out = Narrow(text);
+    LocalFree(text);
+    return out;
+}
+
+// What the driver's host process is (the pipe's creator and owner), for the log: its token's user,
+// owner, integrity level, and whether it is restricted (with its restricting SIDs). Well-known
+// service SIDs, no person's.
+void LogHostToken(Driver* driver) {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        driver->trace.events.Add("pipe: the host's token cannot be read (error %lu)", GetLastError());
+        return;
+    }
+    auto query = [&](TOKEN_INFORMATION_CLASS what) {
+        std::vector<BYTE> data;
+        DWORD size = 0;
+        GetTokenInformation(token, what, nullptr, 0, &size);
+        if (size == 0 || size > 65536) {
+            return data;
+        }
+        data.resize(size);
+        if (!GetTokenInformation(token, what, data.data(), size, &size)) {
+            data.clear();
+        }
+        return data;
+    };
+    std::vector<BYTE> user = query(TokenUser), owner = query(TokenOwner), label = query(TokenIntegrityLevel), restricting = query(TokenRestrictedSids);
+    std::string restrictedSids;
+    if (!restricting.empty()) {
+        const auto* groups = reinterpret_cast<const TOKEN_GROUPS*>(restricting.data());
+        for (DWORD i = 0; i < groups->GroupCount && i < 6; ++i) {
+            restrictedSids += (i ? "," : "") + SidText(groups->Groups[i].Sid);
+        }
+    }
+    driver->trace.events.Add("pipe: host token user %s owner %s integrity %s restricted %d (%s)",
+                             user.empty() ? "?" : SidText(reinterpret_cast<const TOKEN_USER*>(user.data())->User.Sid).c_str(),
+                             owner.empty() ? "?" : SidText(reinterpret_cast<const TOKEN_OWNER*>(owner.data())->Owner).c_str(),
+                             label.empty() ? "?" : SidText(reinterpret_cast<const TOKEN_MANDATORY_LABEL*>(label.data())->Label.Sid).c_str(),
+                             IsTokenRestricted(token) ? 1 : 0, restrictedSids.empty() ? "none" : restrictedSids.c_str());
+    CloseHandle(token);
 }
 
 }  // namespace
@@ -66,6 +115,7 @@ void ControlPipe::Listen() {
         return;  // no pipe rather than one open to anyone
     }
     SECURITY_ATTRIBUTES security = {sizeof(security), descriptor, FALSE};
+    LogHostToken(m_Driver);
     // The first instance is made with FILE_FLAG_FIRST_PIPE_INSTANCE: if another program already made a pipe of this name (to
     // receive the agent's commands, or answer them), creation fails instead of joining its pipe. From then on this listener
     // always holds an instance (the next one is made before the connected one is handed over), so the name never becomes free
