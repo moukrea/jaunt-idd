@@ -85,7 +85,7 @@ IDDCX_TARGET_MODE TargetMode(uint32_t width, uint32_t height, uint32_t refresh) 
     // limit, "if the driver does not have these restrictions then it can set all bandwidths to
     // zero"): a bandwidth above zero against a limit of zero is a mode no path could take. (0.2.0
     // stated width * height * refresh here.)
-    mode.RequiredBandwidth = 0;
+    mode.RequiredBandwidth = static_cast<UINT64>(refresh) * width * height;  // BISECT ONLY: the 0.2.0 value, with the EDID kept
     return mode;
 }
 
