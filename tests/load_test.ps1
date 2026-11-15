@@ -521,24 +521,40 @@ try {
         $pong = Ask $pipe "ping"
         $refused = Ask $pipe "add 100 100 60"
         Step "ping answered, a size out of range refused" ($pong -eq "pong" -and $refused -like "error *") ([ordered]@{ ping = $pong; add100 = $refused })
-        # Two connections at once: the driver makes the next instance while one is connected (it
-        # always holds one, so the name is never free for another program), and serves both.
-        # (The first connection is pinged just before, and the second waited for 2 s at most: the
-        # watchdog, 5 s, never closes the first meanwhile.)
-        $second = $null
-        $both = [ordered]@{}
+        # Who may open the pipe, as Windows holds it (the client handle reads it): SYSTEM and the
+        # allowed account (here, the account that installed it), nobody else (no OWNER RIGHTS, no
+        # LocalService: the driver's own account made its instances under a startup DACL, then set
+        # this one, and must have been refused one more instance after).
+        $dacl = $null
+        $principals = @()
+        try {
+            $access = $pipe.GetAccessControl()
+            $dacl = $access.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access)
+            # Full SIDs (SDDL may abbreviate some, e.g. LA for an account whose RID is 500).
+            $principals = @($access.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | ForEach-Object { "$($_.AccessControlType) $($_.IdentityReference.Value)" } | Sort-Object -Unique)
+        } catch { $dacl = "unreadable: $($_.Exception.Message)" }
+        $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $expected = @("Allow S-1-5-18", "Allow $me")
+        $pipeLog = @(DriverLog $pipe | Where-Object { $_ -match "pipe: " })
+        $refusedNow = @($pipeLog | Where-Object { $_ -match "a further instance is refused now \(error 5\)" })
+        $unexpected = @($pipeLog | Where-Object { $_ -match "UNEXPECTED|cannot be made|could not be set" })
+        Step "the pipe's DACL: SYSTEM and the allowed account only; the driver's account refused a further instance" `
+            (($principals -join ",") -eq (($expected | Sort-Object) -join ",") -and $refusedNow.Count -eq 1 -and -not $unexpected.Count) `
+            ([ordered]@{ dacl = $(if ($dacl) { $dacl.Replace($me, "<allowed>") } else { $null }); principals = @($principals | ForEach-Object { if ($_ -eq $me) { "<allowed>" } else { $_ } }); pipeLog = @($pipeLog | ForEach-Object { $_.Replace($me, "<allowed>") }) })
+        # Ten connections at once (a monitor each, and more): all served, from the pool of instances
+        # the driver made at its start. (The first connection is pinged just before, and the others are
+        # opened within 2 s each: the watchdog, 5 s, closes none meanwhile.)
+        $others = @()
+        $answers = @()
         try {
             $null = Ask $pipe "ping"
-            $second = Connect 2000
-            $both.second = Ask $second "ping"
-            $both.first = Ask $pipe "ping"
-        } catch { $both.error = $_.Exception.Message }
-        if ($second) { $second.Dispose() }
+            foreach ($n in 1..9) { $others += Connect 2000 }
+            foreach ($o in $others) { $answers += Ask $o "ping" }
+            $answers += Ask $pipe "ping"
+        } catch { $answers += "error: $($_.Exception.Message)" }
+        foreach ($o in $others) { $o.Dispose() }
         try { $null = Ask $pipe "ping" } catch { $pipe.Dispose(); $pipe = Connect }  # the first connection kept, or a new one
-        $both.pipeLog = @(DriverLog $pipe | Where-Object { $_ -match "pipe: " })
-        $nextRefused = @($both.pipeLog | Where-Object { $_ -match "next instance cannot be made|first instance cannot be made" })
-        Step "two connections at once, both answered; the next instance made each time" ($both.second -eq "pong" -and $both.first -eq "pong" -and -not $nextRefused.Count) `
-            ([ordered]@{ answers = $both; driverLogSays = $nextRefused })
+        Step "ten connections at once, all answered" (@($answers | Where-Object { $_ -eq "pong" }).Count -eq 10) ([ordered]@{ answers = $answers })
 
         # ---- a silent connection loses its monitor (the watchdog, 5 s) ---------------------------
         $added = Ask $pipe "add 1280 720 60"

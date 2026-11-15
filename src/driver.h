@@ -139,15 +139,17 @@ public:
     ~ControlPipe();
 
 private:
-    void Listen();
+    void Start();                // makes the pool of instances, sets the final DACL, starts them
+    void Instance(HANDLE pipe);  // one instance: a client served, disconnected, the next awaited
     void Serve(HANDLE pipe, uint32_t connection);
 
     Driver* m_Driver;
-    std::wstring m_Sddl;
+    std::wstring m_AllowedSid;
+    HANDLE m_StopEvent = nullptr;
     std::atomic<bool> m_Stop{false};
     std::thread m_Listener;
     std::mutex m_Lock;
-    std::vector<std::thread> m_Connections;
+    std::vector<std::thread> m_Instances;
     std::atomic<uint32_t> m_NextConnection{1};
 };
 
