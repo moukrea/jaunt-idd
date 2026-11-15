@@ -30,8 +30,11 @@ std::string Narrow(const std::wstring& text) {
 }  // namespace
 
 ControlPipe::ControlPipe(Driver* driver, const std::wstring& allowedSid) : m_Driver(driver) {
-    // Protected (no inherited entries): SYSTEM, and that account when one is named.
-    m_Sddl = L"D:P(A;;GA;;;SY)";
+    // Protected (no inherited entries): SYSTEM, and that account when one is named. The pipe's owner
+    // (the account the driver's host runs as, LocalService) gets FILE_CREATE_PIPE_INSTANCE (0x4)
+    // alone, through OWNER RIGHTS: Windows checks it on every instance after the first, and without
+    // it the next instance could not be made while a connection holds one.
+    m_Sddl = L"D:P(A;;GA;;;SY)(A;;0x4;;;OW)";
     if (!allowedSid.empty()) {
         m_Sddl += L"(A;;GRGW;;;" + allowedSid + L")";
     }
@@ -105,14 +108,22 @@ void ControlPipe::Listen() {
             continue;
         }
         // The next instance first, while the connected one still holds the name.
-        HANDLE next = INVALID_HANDLE_VALUE;
-        while (!m_Stop && (next = create(false)) == INVALID_HANDLE_VALUE) {
-            Sleep(1000);
-        }
+        HANDLE next = create(false);
+        const DWORD nextError = next == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+        // The connection is served whatever happened: a client is never left without an answer.
         uint32_t connection = m_NextConnection++;
         {
             std::lock_guard<std::mutex> lock(m_Lock);
             m_Connections.emplace_back([this, pipe, connection] { Serve(pipe, connection); });
+        }
+        if (next == INVALID_HANDLE_VALUE) {
+            // Not made (it should be: see the security descriptor). Then a first instance again, once
+            // the connections served have closed theirs: never another program's pipe.
+            m_Driver->trace.events.Add("pipe: the next instance cannot be made (error %lu); a first instance again once the connections close",
+                                       nextError);
+            while (!m_Stop && (next = create(true)) == INVALID_HANDLE_VALUE) {
+                Sleep(250);
+            }
         }
         pipe = next;
     }

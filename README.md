@@ -22,7 +22,9 @@ Driver (NOTICE.md).
   not Administrators, not remote clients (`PIPE_REJECT_REMOTE_CLIENTS`). Its first instance is made
   with `FILE_FLAG_FIRST_PIPE_INSTANCE`, so the driver never joins a pipe of that name another
   program made first, and it always holds an instance (the next one is made before a connected one
-  is handed over), so the name is never free for another program between two connections. Without that value, SYSTEM
+  is handed over), so the name is never free for another program between two connections. For that
+  the pipe's owner (the account the driver's host runs as) may create its instances
+  (`FILE_CREATE_PIPE_INSTANCE` through OWNER RIGHTS), and nothing else. Without that value, SYSTEM
   only.
 - **A monitor never outlives the program that asked for it:** each connection's monitors are removed
   when it closes, when its process ends, or when it sends nothing for 5 seconds (the watchdog; jaunt

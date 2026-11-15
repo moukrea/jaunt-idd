@@ -521,6 +521,19 @@ try {
         $pong = Ask $pipe "ping"
         $refused = Ask $pipe "add 100 100 60"
         Step "ping answered, a size out of range refused" ($pong -eq "pong" -and $refused -like "error *") ([ordered]@{ ping = $pong; add100 = $refused })
+        # Two connections at once: the driver makes the next instance while one is connected (it
+        # always holds one, so the name is never free for another program), and serves both.
+        $second = $null
+        $both = [ordered]@{}
+        try {
+            $second = Connect
+            $both.second = Ask $second "ping"
+            $both.first = Ask $pipe "ping"
+        } catch { $both.error = $_.Exception.Message }
+        if ($second) { $second.Dispose() }
+        $nextRefused = @(DriverLog $pipe | Where-Object { $_ -match "next instance cannot be made|first instance cannot be made" })
+        Step "two connections at once, both answered; the next instance made each time" ($both.second -eq "pong" -and $both.first -eq "pong" -and -not $nextRefused.Count) `
+            ([ordered]@{ answers = $both; driverLogSays = $nextRefused })
 
         # ---- a silent connection loses its monitor (the watchdog, 5 s) ---------------------------
         $added = Ask $pipe "add 1280 720 60"
